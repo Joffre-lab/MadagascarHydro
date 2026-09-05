@@ -1,0 +1,3 @@
+﻿# Ignorer les modèles ML locaux (téléchargés depuis Hugging Face en prod)
+Q10_Model_Prediction/
+*.joblib
