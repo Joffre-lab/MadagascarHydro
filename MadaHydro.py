@@ -2,7 +2,6 @@ import os
 import streamlit as st
 
 # --- 1. Configuration GDAL pour streaming HTTP Range / COG ---
-# Important : ces variables doivent être définies AVANT l'import de rasterio.
 os.environ.setdefault("GDAL_HTTP_USERAGENT", "MadaHydro/1.0")
 os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "NO")
 os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
@@ -25,10 +24,10 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# Hugging Face : le modèle (petit fichier) est téléchargé via huggingface_hub.
-# Les gros GeoTIFF restent distants et sont lus à la demande par GDAL.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
+import time
+import gc
 import pandas as pd
 import leafmap.foliumap as leafmap
 from streamlit_folium import st_folium
@@ -43,7 +42,6 @@ import io
 import tempfile
 import zipfile
 import re
-import traceback
 import joblib
 from huggingface_hub import hf_hub_download
 from hydrology_pdf import create_pdf_report
@@ -54,12 +52,6 @@ HF_REPO_TYPE = "dataset"
 HF_BASE_URL = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main"
 
 def hf_vsi_url(filename: str) -> str:
-    """Retourne directement l'URL HF utilisable par GDAL /vsicurl/.
-
-    On ne résout volontairement PAS la redirection avec requests.
-    GDAL gère lui-même HTTP + Range, ce qui évite de figer une URL
-    temporaire/signée Xet susceptible d'expirer.
-    """
     encoded = filename.replace("\\", "/")
     return f"/vsicurl/{HF_BASE_URL}/{encoded}"
 
@@ -76,7 +68,7 @@ WORLD_COVER_PATHS    = [
 MODEL_HF_FILENAME = "Q10_Model_Prediction/Q10_global_logq10.joblib"
 VALID_PRO_KEYS = ["HYDRO-PRO-2026", "MADA-HYDRO-PRO", "EXUTOIRE-2026"]
 
-# 1. Chargement du Modèle ML
+# --- Modèle ML & Classes ---
 class Q10FeatureEngineer:
     def __init__(self):
         self.feature_names_out_ = [
@@ -94,12 +86,6 @@ class Q10FeatureEngineer:
 
 @st.cache_resource
 def load_q10_model():
-    """Charge paresseusement le petit modèle ML depuis le dataset HF.
-
-    Contrairement aux GeoTIFF, le modèle est suffisamment petit pour être
-    mis en cache localement par huggingface_hub. Aucun gros raster n'est
-    téléchargé ici.
-    """
     try:
         local_model = hf_hub_download(
             repo_id=HF_REPO_ID,
@@ -118,23 +104,26 @@ def load_q10_model():
 def get_q10_model():
     return load_q10_model()
 
-# 2. Fonctions Hydrologiques & Rasters
 def get_madagascar_utm_epsg(longitude):
     return 32739 if longitude >= 48.0 else 32738
 
-def compute_passini_tc(area_km2, l_rect_km, slope_m_m):
-    safe_slope  = max(slope_m_m, 0.0001)
-    safe_length = max(l_rect_km, 0.1)
-    tc_hours    = 0.108 * ((area_km2 * safe_length) ** (1.0 / 3.0)) / np.sqrt(safe_slope)
-    return max(tc_hours, 0.1)
+def compute_passini_tc(area_km2, l_rect_km, slope_m_km):
+    """Calcul du temps de concentration de Passini (en heures).
+    Pente en m/m = slope_m_km / 1000.0.
+    """
+    safe_slope_m_m = max(float(slope_m_km) / 1000.0, 0.0001)
+    safe_length    = max(float(l_rect_km), 0.1)
+    safe_area      = max(float(area_km2), 0.01)
+    
+    tc_hours = 0.108 * ((safe_area * safe_length) ** (1.0 / 3.0)) / np.sqrt(safe_slope_m_m)
+    return max(round(tc_hours, 2), 0.10)
 
 def detect_versant(lat, lon):
-
     if lat > -16.0:
         return "Nord_Est" if lon >= 48.0 else "Nord_Ouest"
     elif lat < -22.0:
         return "Sud_Est" if lon >= 46.5 else "Sud"
-    else:  # Entre -22.0 et -16.0 (Milieu de l'île)
+    else:
         if lon >= 47.5:
             return "Centre_Est"
         elif lon <= 45.5:
@@ -142,8 +131,8 @@ def detect_versant(lat, lon):
         else:
             return "Hautes_Terres"
 
+# --- Fonctions raster & calculs mis en CACHE ---
 def get_local_raster_mean(gdf_polygon, raster_path, fallback_value, max_dim=512):
-    """Moyenne spatiale avec lecture bornée pour limiter RAM et trafic HTTP."""
     try:
         with rasterio.open(raster_path) as src:
             gdf_proj = gdf_polygon.to_crs(src.crs)
@@ -184,7 +173,9 @@ def get_local_raster_mean(gdf_polygon, raster_path, fallback_value, max_dim=512)
         pass
     return fallback_value
 
-def extract_local_landcover(gdf_polygon, area_km2):
+@st.cache_data(show_spinner=False)
+def extract_local_landcover_cached(gdf_json: str, area_km2: float):
+    gdf_polygon = gpd.read_file(io.StringIO(gdf_json))
     fallback = (0.80, 0.80, 0.50, 0.00, False, pd.DataFrame())
     raster_files = WORLD_COVER_PATHS
 
@@ -205,10 +196,9 @@ def extract_local_landcover(gdf_polygon, area_km2):
                 gdf_proj = gdf_polygon.to_crs(src.crs)
                 shapes = [geom for geom in gdf_proj.geometry]
                 try:
-                    # WorldCover est catégoriel : nearest-neighbour conserve les classes.
                     win = geometry_window(src, shapes, pad_x=0, pad_y=0)
-                    out_h = min(1000, max(1, int(win.height)))
-                    out_w = min(1000, max(1, int(win.width)))
+                    out_h = min(512, max(1, int(win.height)))
+                    out_w = min(512, max(1, int(win.width)))
                     data = src.read(
                         1,
                         window=win,
@@ -257,7 +247,7 @@ def extract_local_landcover(gdf_polygon, area_km2):
                 wet_pixels += count
 
     df_lc = pd.DataFrame(lc_data).sort_values("Surface (km²)", ascending=False)
-    return e_sum / total_pixels, g_sum / total_pixels, v_sum / total_pixels, wet_pixels / total_pixels, True, df_lc
+    return float(e_sum / total_pixels), float(g_sum / total_pixels), float(v_sum / total_pixels), float(wet_pixels / total_pixels), True, df_lc
 
 def calibrer_indices_egv(g_raw, v_raw, e_raw, pct_wet, area_km2, versant):
     if pct_wet > 0.30 and e_raw > 0.50 and area_km2 > 50:
@@ -265,7 +255,9 @@ def calibrer_indices_egv(g_raw, v_raw, e_raw, pct_wet, area_km2, versant):
     else: e_cal = e_raw
     return g_raw, v_raw, e_cal
 
-def calculate_local_rainfall_and_design(gdf_polygon):
+@st.cache_data(show_spinner=False)
+def calculate_local_rainfall_cached(gdf_json: str):
+    gdf_polygon = gpd.read_file(io.StringIO(gdf_json))
     p_annuelle_mm = get_local_raster_mean(gdf_polygon, ANNUAL_RAINFALL_PATH, 1450.0)
     p10_mm        = get_local_raster_mean(gdf_polygon, P10_RAINFALL_PATH, 142.0)
 
@@ -278,7 +270,7 @@ def calculate_local_rainfall_and_design(gdf_polygon):
         50:  round(p10_mm * 1.254, 1),
         100: round(p10_mm * 1.362, 1),
     }
-    return p_annuelle_mm, p_mensuelles, p_design
+    return float(p_annuelle_mm), p_mensuelles, p_design
 
 def compute_q10_ml(model, area_km2, p10_mm, slope_m_km, e_cal, g_cal, v_cal, p_design):
     log_surface = float(np.log(max(area_km2, 0.01)))
@@ -294,33 +286,13 @@ def compute_q10_ml(model, area_km2, p10_mm, slope_m_km, e_cal, g_cal, v_cal, p_d
     for T in [25, 50, 100]: q_dict[T] = Q10 * (p_design[T] / p10) ** 1.39
     return q_dict
 
-def compute_orstom_discharges(area_km2, slope_m_km, p_design, tc_passini_hrs):
-    q_dict = {}
-    safe_slope_m_km = max(float(slope_m_km), 0.5)
-
-    if area_km2 <= 4.0:
-        method = f"Rationnelle (Passini Tc = {tc_passini_hrs:.2f} h)"
-        for T, P_val in p_design.items():
-            q_dict[T] = 0.278 * 0.5 * (P_val / max(tc_passini_hrs, 0.25)) * area_km2
-    elif 4.0 < area_km2 <= 150.0:
-        method = "ORSTOM / SOMEAH (4 < S ≤ 150 km²)"
-        for T, P_val in p_design.items():
-            q_dict[T] = 0.009 * (area_km2 ** 0.5) * (safe_slope_m_km ** 0.32) * (P_val ** 1.39)
-    else:
-        method = "LOUIS DURET (S > 150 km²)"
-        for T, P_val in p_design.items():
-            q_dict[T] = 0.002 * (area_km2 ** 0.8) * (safe_slope_m_km ** 0.32) * (P_val ** 1.39)
-
-    return q_dict, method
-
-# 3. Moteur d'Auto-Expansion Dynamique
+# --- Moteur d'Auto-Expansion Dynamique (Max 3 iterations) ---
 def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
     xmin, xmax = target_lon - initial_buffer, target_lon + initial_buffer
     ymin, ymax = target_lat - initial_buffer, target_lat + initial_buffer
     d8_esri = (64, 128, 1, 2, 4, 8, 16, 32)
-    max_iterations = 6
+    max_iterations = 3
     expansion_log = []
-    fully_enclosed = False
 
     for iteration in range(1, max_iterations + 1):
         bbox = (xmin, ymin, xmax, ymax)
@@ -329,7 +301,10 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
         sub_acc = sub_grid.read_raster(FLOW_ACC_PATH, window=bbox, dtype=np.float32)
 
         mask_val = sub_acc > threshold
-        if not np.any(mask_val): raise ValueError(f"Aucun cours d'eau trouvé avec un seuil de {threshold}. Diminuez-le.")
+        if not np.any(mask_val): 
+            del sub_grid, sub_fdir, sub_acc
+            gc.collect()
+            raise ValueError(f"Aucun cours d'eau trouvé avec un seuil de {threshold}. Diminuez-le.")
 
         x_snap, y_snap = sub_grid.snap_to_mask(mask_val, (target_lon, target_lat))
         catchment = sub_grid.catchment(x=x_snap, y=y_snap, fdir=sub_fdir, d8_mapping=d8_esri, xytype="coordinate")
@@ -339,7 +314,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
 
         if not (touch_west or touch_east or touch_south or touch_north):
             expansion_log.append(f"✅ Bassin englobé à l'essai {iteration}.")
-            fully_enclosed = True
             break
 
         step = max(initial_buffer * 0.8, 0.4)
@@ -348,16 +322,35 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
         if touch_south: ymin -= step
         if touch_north: ymax += step
 
-    # On retourne uniquement les deux rasters nécessaires à la délimitation.
-    return sub_grid, catchment, sub_fdir, sub_acc, bbox, expansion_log
+        # Nettoyage entre les itérations
+        del sub_grid, sub_fdir, sub_acc, catchment
+        gc.collect()
+
+    shapes = sub_grid.polygonize(catchment.astype(np.uint8))
+    features = [{"geometry": s, "properties": {"id": 1}} for s, v in shapes if v == 1]
+    
+    # Extraction propre des variables locales avant libération mémoire
+    fdir_data, acc_data, grid_obj = sub_fdir, sub_acc, sub_grid
+    return grid_obj, catchment, fdir_data, acc_data, features
+
+def extract_river_network_ondemand(target_lon, target_lat, buffer_deg, threshold):
+    """Extraction à la demande du réseau hydrographique pour limiter la RAM."""
+    try:
+        grid_obj, catchment, sub_fdir, sub_acc, _ = get_dynamic_catchment(target_lon, target_lat, buffer_deg, threshold)
+        stream_mask = ((sub_acc > threshold) & catchment).astype(bool)
+        branches = grid_obj.extract_river_network(sub_fdir, stream_mask)
+        
+        del grid_obj, catchment, sub_fdir, sub_acc
+        gc.collect()
+
+        if len(branches["features"]) > 0:
+            stream_gdf_raw = gpd.GeoDataFrame.from_features(branches).set_crs("EPSG:4326")
+            return stream_gdf_raw
+    except Exception as e:
+        print(f"[River Extraction] Erreur : {e}")
+    return None
 
 def test_remote_raster(raster_path: str):
-    """Test léger GDAL : ouvre le GeoTIFF distant puis lit une petite fenêtre.
-
-    Cette fonction est volontairement bornée : elle ne déclenche jamais un
-    téléchargement complet du raster.
-    """
-    import time
     t0 = time.perf_counter()
     with rasterio.open(raster_path) as src:
         info = {
@@ -372,22 +365,30 @@ def test_remote_raster(raster_path: str):
     info["elapsed_s"] = round(time.perf_counter() - t0, 2)
     return info
 
-# 4.Session State
+# --- 3. Configuration & State ---
 st.set_page_config(layout="wide", page_title="MadaHydro", page_icon="🇲🇬", initial_sidebar_state="expanded")
-APP_VERSION = "HF-COG-STREAM-v3"
+APP_VERSION = "HF-COG-STREAM-v3-OPT"
 
-def create_shapefile_zip(gdf_dict):
+@st.cache_data(show_spinner=False)
+def create_shapefile_zip_cached(bassin_json: str, reseau_json: str = None):
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            for layer_name, gdf in gdf_dict.items():
-                if gdf is not None and not gdf.empty:
-                    gdf.to_file(os.path.join(tmp_dir, f"{layer_name}.shp"), driver="ESRI Shapefile")
-                    for fname in os.listdir(tmp_dir):
-                        if fname.startswith(layer_name):
-                            zf.write(os.path.join(tmp_dir, fname), arcname=fname)
+            gdf_bassin = gpd.read_file(io.StringIO(bassin_json))
+            gdf_bassin.to_file(os.path.join(tmp_dir, "bassin.shp"), driver="ESRI Shapefile")
+            
+            if reseau_json:
+                gdf_reseau = gpd.read_file(io.StringIO(reseau_json))
+                gdf_reseau.to_file(os.path.join(tmp_dir, "reseau.shp"), driver="ESRI Shapefile")
+                
+            for fname in os.listdir(tmp_dir):
+                zf.write(os.path.join(tmp_dir, fname), arcname=fname)
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
+
+@st.cache_data(show_spinner=False)
+def create_pdf_report_cached(m_data: dict, center_coords: list):
+    return create_pdf_report(m_data, center_coords)
 
 def parse_coordinate(coord_str, is_latitude=True):
     if not coord_str or not isinstance(coord_str, str): raise ValueError("Format invalide")
@@ -428,7 +429,7 @@ for _key, _default in [
 if st.query_params.get("key", "") in VALID_PRO_KEYS:
     st.session_state.is_pro = True
 
-# 5. Interface Utilisateur & Barre Latérale
+# --- 4. Interface Utilisateur & CSS ---
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
@@ -474,14 +475,6 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.3px; }
 .mh-side-status strong, .mh-side-status span { display: block; }
 .mh-side-status strong { font-size: 0.78rem; }
 .mh-side-status span { margin-top: 0.08rem; font-size: 0.66rem; color: var(--mh-muted); }
-.mh-stage { display: flex; align-items: center; gap: 0.7rem; border-radius: 13px; padding: 0.67rem 0.8rem; margin: 0.2rem 0 0.9rem 0; border: 1px solid var(--mh-border); }
-.mh-stage.idle { background: rgba(14,165,233,0.045); }
-.mh-stage.done { background: rgba(16,185,129,0.045); }
-.stage-icon { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 9px; background: rgba(255,255,255,0.85); border: 1px solid var(--mh-border); }
-.mh-stage strong, .mh-stage span { display: block; }
-.mh-stage strong { font-size: 0.78rem; }
-.mh-stage span { font-size: 0.69rem; color: var(--mh-muted); margin-top: 0.08rem; }
-.stage-right { margin-left: auto; font-size: 0.6rem; font-weight: 800; letter-spacing: 0.7px; padding: 0.25rem 0.42rem; border-radius: 999px; background: rgba(15,23,42,0.055); color: #475569; }
 .mh-section-title { display: flex; gap: 0.58rem; align-items: center; margin: 0.1rem 0 0.55rem 0; }
 .mh-section-title > span { width: 33px; height: 33px; display: flex; align-items: center; justify-content: center; border-radius: 10px; background: rgba(14,165,233,0.08); border: 1px solid rgba(14,165,233,0.13); }
 .mh-section-title strong, .mh-section-title small { display: block; }
@@ -518,7 +511,7 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-with st.sidebar.expander(" 1 · Exutoire", expanded=True):
+with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
     input_mode = st.radio("Méthode de sélection", ["Clic sur la carte", "Saisie manuelle"], index=0, horizontal=True, label_visibility="collapsed")
     target_lat, target_lon = None, None
     do_phase_1 = False
@@ -550,7 +543,7 @@ with st.sidebar.expander("⚙️ 2 · Paramètres de délimitation", expanded=Tr
 with st.sidebar.expander("🗺️ 3 · Affichage de la carte", expanded=False):
     map_basemap = st.selectbox("Fond cartographique", ["HYBRID", "SATELLITE", "ROADMAP", "TERRAIN"], index=0)
     show_catchment = st.checkbox("Afficher le bassin", value=True)
-    show_network = st.checkbox("Afficher le réseau hydrographique", value=True)
+    show_network = st.checkbox("Afficher le réseau hydrographique", value=False, help="Calculé à la demande pour préserver les ressources.")
     map_height = st.select_slider("Hauteur de la carte", options=[620, 680, 740, 800], value=740)
 
 with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
@@ -566,6 +559,7 @@ with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
     if st.button("↺ Réinitialiser l'analyse", width="stretch"):
         for _k, _v in [("last_coords", None), ("hydro_computed", False), ("catchment_gdf", None), ("stream_gdf", None), ("metrics", None), ("center_coords", [-18.7669, 46.8691]), ("map_zoom", 6), ("map_bounds", None)]:
             st.session_state[_k] = _v
+        gc.collect()
         st.rerun()
 
     if st.button("🔎 Tester le streaming GDAL", width="stretch", help="Test lit seulement une petite fenêtre de FlowDir distant."):
@@ -594,14 +588,7 @@ else:
             else:
                 st.error("Code d'accès invalide ou expiré.")
 
-# --- Cartouche d'état ---
-# if st.session_state.metrics is None:
-    stage_title, stage_text, stage_icon, stage_class = "Prêt pour la délimitation", "Sélectionnez un exutoire sur la carte ou renseignez ses coordonnées.", "🎯", "idle"
-# else:
-    stage_title, stage_text, stage_icon, stage_class = "Bassin versant identifié", "La géométrie a été extraite. Consultez les résultats dans le panneau d'analyse.", "✅", "done"
-
-# st.markdown(f'<div class="mh-stage {stage_class}"><div class="stage-icon">{stage_icon}</div><div><strong>{stage_title}</strong><span>{stage_text}</span></div><div class="stage-right">{"PRO" if st.session_state.is_pro else "FREE"}</div></div>', unsafe_allow_html=True)
-
+# --- Conteneurs principaux ---
 col_map, col_panel = st.columns([1.7, 1], gap="large")
 
 with col_map:
@@ -612,8 +599,17 @@ with col_map:
 
     if show_catchment and st.session_state.catchment_gdf is not None:
         m.add_gdf(st.session_state.catchment_gdf, layer_name="Bassin versant", style={"color": "#ef4444", "weight": 3, "fillColor": "#ef4444", "fillOpacity": 0.20})
-    if show_network and st.session_state.stream_gdf is not None and not st.session_state.stream_gdf.empty:
-        m.add_gdf(st.session_state.stream_gdf, layer_name="Réseau hydrographique", style={"color": "#06b6d4", "weight": 2})
+    
+    # Calcul à la demande du réseau hydrographique si l'utilisateur coche la case
+    if show_network and st.session_state.catchment_gdf is not None and st.session_state.last_coords is not None:
+        if st.session_state.stream_gdf is None:
+            with st.spinner("Extraction à la demande du réseau hydrographique..."):
+                lon_e, lat_e = st.session_state.last_coords[1], st.session_state.last_coords[0]
+                eff_acc = max(accumulation_threshold, int(buffer_deg * 25000))
+                st.session_state.stream_gdf = extract_river_network_ondemand(lon_e, lat_e, buffer_deg, eff_acc)
+
+        if st.session_state.stream_gdf is not None and not st.session_state.stream_gdf.empty:
+            m.add_gdf(st.session_state.stream_gdf, layer_name="Réseau hydrographique", style={"color": "#06b6d4", "weight": 2})
         
     if st.session_state.map_bounds is not None:
         m.fit_bounds(st.session_state.map_bounds)
@@ -652,7 +648,9 @@ with col_panel:
                 lat0, lon0 = st.session_state.last_coords
                 st.caption(f"Exutoire : **{lat0:.5f}°, {lon0:.5f}°**")
             if st.session_state.catchment_gdf is not None:
-                zip_bytes = create_shapefile_zip({"bassin": st.session_state.catchment_gdf, "reseau": st.session_state.stream_gdf})
+                bassin_json = st.session_state.catchment_gdf.to_json()
+                reseau_json = st.session_state.stream_gdf.to_json() if st.session_state.stream_gdf is not None else None
+                zip_bytes = create_shapefile_zip_cached(bassin_json, reseau_json)
                 st.download_button("📦 Télécharger les couches.shp SIG (.ZIP)", zip_bytes, f"bassin_{st.session_state.center_coords[0]:.2f}.zip", "application/zip", width="stretch")
 
         if st.session_state.is_pro:
@@ -720,7 +718,7 @@ with col_panel:
                     st.markdown("* **MNT & Altimétrie** · Copernicus / FABDEM 30m\n* **Occupation du sol** · ESA WorldCover v200 (10m)\n* **Pluviométrie** · CHIRPS v2.0 calibré avec 21 stations pluvio à Mada \n* **Intelligence Artificielle** · Gradient boosting regressor")
 
                 m_data['slope_pct'] = m_data['slope_m_m'] * 100.0
-                pdf_bytes = create_pdf_report(m_data, st.session_state.center_coords)
+                pdf_bytes = create_pdf_report_cached(m_data, st.session_state.center_coords)
                 st.download_button("📄 Télécharger le rapport complet (.PDF)", pdf_bytes, f"Rapport_Hydro_{st.session_state.center_coords[0]:.2f}.pdf", "application/pdf", type="primary", width="stretch")
             else:
                 st.info("🔄 Profilage hydrologique en cours…")
@@ -761,44 +759,26 @@ with st.expander("📖 Guide d'utilisation · MadaHydro Watershed Explorer", exp
     """)
 st.markdown('</div>', unsafe_allow_html=True)
 
-# 7. Pipelines d'Exécution
+# --- 5. Pipelines d'Exécution Optimisés ---
 if do_phase_1:
     try:
+        t_phase1_start = time.perf_counter()
         with st.spinner("1/2 Délimitation et extraction géométrique..."):
             effective_acc = max(accumulation_threshold, int(buffer_deg * 25000))
-            sub_grid, catchment, sub_fdir, sub_acc, raster_bbox, exp_log = get_dynamic_catchment(target_lon, target_lat, buffer_deg, effective_acc)
+            grid_obj, catchment, sub_fdir, sub_acc, features = get_dynamic_catchment(target_lon, target_lat, buffer_deg, effective_acc)
             target_epsg = get_madagascar_utm_epsg(target_lon)
 
-            stream_mask = ((sub_acc > effective_acc) & catchment).astype(bool)
-            
-            try:
-                branches = sub_grid.extract_river_network(sub_fdir, stream_mask)
-                if len(branches["features"]) > 0:
-                    stream_gdf_raw = gpd.GeoDataFrame.from_features(branches).set_crs("EPSG:4326")
-                    stream_gdf_proj = stream_gdf_raw.to_crs(epsg=target_epsg)
-                    
-                    # Calcul de la longueur maximale du chenal principal
-                    main_channel_len_m = float(stream_gdf_proj.geometry.length.max())
-                    stream_gdf = stream_gdf_proj.to_crs(epsg=4326)
-                else:
-                    stream_gdf = None
-                    main_channel_len_m = 5000.0
-            except Exception as e:
-                # Affichage de l'erreur dans la console Streamlit pour le débogage
-                print(f"Erreur extraction rivieres : {e}")
-                stream_gdf = None
-                main_channel_len_m = 5000.0
-
-            shapes = sub_grid.polygonize(catchment.astype(np.uint8))
-            features = [{"geometry": s, "properties": {"id": 1}} for s, v in shapes if v == 1]
+            # Libération immédiate des lourds rasters PySheds
+            del grid_obj, catchment, sub_fdir, sub_acc
+            gc.collect()
 
             if features:
                 gdf_raw = gpd.GeoDataFrame.from_features(features).set_crs("EPSG:4326")
                 gdf_proj = gdf_raw.to_crs(epsg=target_epsg)
                 gdf_proj["geometry"] = gdf_proj.geometry.simplify(tolerance=60.0, preserve_topology=True).buffer(40.0, join_style=1).buffer(-40.0, join_style=1)
 
-                area_km2 = gdf_proj.geometry.area.sum() / 1e6
-                perimeter_km = gdf_proj.geometry.length.sum() / 1000.0
+                area_km2 = float(gdf_proj.geometry.area.sum() / 1e6)
+                perimeter_km = float(gdf_proj.geometry.length.sum() / 1000.0)
                 gdf = gdf_proj.to_crs(epsg=4326)
 
                 kc = 0.28 * perimeter_km / np.sqrt(area_km2)
@@ -809,46 +789,47 @@ if do_phase_1:
                 dx, dy = maxx - minx, maxy - miny
                 st.session_state.map_bounds = [[miny - dy * 0.25, minx - dx * 0.25], [maxy + dy * 0.25, maxx + dx * 0.25]]
 
-                # Les indicateurs topographiques détaillés sont calculés
+                # Le mode FREE ne lit aucun DEM : valeurs par défaut légères
                 min_elev = max_elev = z5_m = z95_m = 0.0
                 slope_m_km = 0.5
                 slope_m_m = slope_m_km / 1000.0
 
             st.session_state.catchment_gdf = gdf
-            st.session_state.stream_gdf = stream_gdf
+            st.session_state.stream_gdf = None  # Calculé uniquement à la demande si demandé
             st.session_state.metrics = {
                 "area_km2": area_km2, "perimeter_km": perimeter_km,
                 "min_elev": min_elev, "max_elev": max_elev,
                 "slope_m_km": round(slope_m_km, 2), "slope_m_m": slope_m_m,
                 "kc": round(kc, 3), "l_rect_km": round(l_rect_km, 2),
                 "z5_m": round(z5_m, 1), "z95_m": round(z95_m, 1),
-                "main_channel_len_km": round(main_channel_len_m / 1000.0, 2),
+                "main_channel_len_km": round(l_rect_km, 2),
                 "target_epsg": target_epsg,
             }
             st.session_state.hydro_computed = False
             st.session_state.center_coords = [(miny + maxy) / 2.0, (minx + maxx) / 2.0]
+            
+            t_elapsed = time.perf_counter() - t_phase1_start
+            print(f"[CHRONO] Phase 1 terminée en {t_elapsed:.2f} s")
+            
             st.rerun()
 
     except Exception as e:
-        # ⚠️ CRUCIAL: Modifié pour afficher visiblement l'erreur au lieu de la cacher dans la barre latérale
-        st.error(f"⚠️ Erreur lors de la délimitation (Problème réseau ou coordonnées) : {e}")
+        st.error(f"⚠️ Erreur lors de la délimitation : {e}")
         st.session_state.last_coords = None
 
 if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and not st.session_state.get("hydro_computed", False)):
     try:
+        t_phase2_start = time.perf_counter()
         with st.spinner("2/2 Lecture des Rasters distants & IA..."):
             m_data = st.session_state.metrics
 
-            # le MNT est lu uniquement maintenant, sur la fenêtre
-            # correspondant au bassin déjà délimité. Il n'est jamais téléchargé
-            # intégralement depuis Hugging Face.
+            # Lecture du DEM par fenêtre HTTP Range limitée
             with rasterio.open(DEM_PATH) as dem_src:
                 dem_proj_gdf = st.session_state.catchment_gdf.to_crs(dem_src.crs)
                 dem_shapes = [geom for geom in dem_proj_gdf.geometry if geom is not None and not geom.is_empty]
                 dem_win = geometry_window(dem_src, dem_shapes, pad_x=0, pad_y=0)
-                dem_h = min(700, max(1, int(dem_win.height)))
-                dem_w = min(700, max(1, int(dem_win.width)))
-                # La lecture est effectuée avec src.read(window=..., out_shape=...) ;
+                dem_h = min(512, max(1, int(dem_win.height)))
+                dem_w = min(512, max(1, int(dem_win.width)))
                 
                 dem_arr = dem_src.read(
                     1,
@@ -872,7 +853,6 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
                     valid_mask &= dem_arr != dem_nodata
                 valid_elevs = dem_arr[valid_mask]
                 valid_elevs = valid_elevs[valid_elevs > -50]
-                dem_band = dem_arr
 
             if valid_elevs.size > 0:
                 pos_elevs = valid_elevs[valid_elevs > 0]
@@ -892,22 +872,25 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
                 "z5_m": round(z5_m, 1), "z95_m": round(z95_m, 1),
             })
 
-            del dem_arr, dem_band, valid_elevs
-            import gc
+            # Correction Passini Tc
+            tc_passini = compute_passini_tc(m_data["area_km2"], m_data["l_rect_km"], slope_m_km)
+            m_data["tc_passini_hours"] = tc_passini
+
+            del dem_arr, valid_elevs
             gc.collect()
 
-            p_annuelle_mm, p_mensuelles, p_design = calculate_local_rainfall_and_design(st.session_state.catchment_gdf)
+            catchment_json = st.session_state.catchment_gdf.to_json()
+            p_annuelle_mm, p_mensuelles, p_design = calculate_local_rainfall_cached(catchment_json)
+            
             lat_exu, lon_exu = st.session_state.last_coords
             versant = detect_versant(lat_exu, lon_exu)
-            # Un seul modèle global : le versant est une métadonnée spatiale,
-            # pas une règle d'exclusion du modèle.
             in_domain = True
-            e_raw, g_raw, v_raw, pct_wet, lc_ok, df_lc = extract_local_landcover(st.session_state.catchment_gdf, m_data["area_km2"])
+
+            e_raw, g_raw, v_raw, pct_wet, lc_ok, df_lc = extract_local_landcover_cached(catchment_json, m_data["area_km2"])
             g_cal, v_cal, e_cal = calibrer_indices_egv(g_raw, v_raw, e_raw, pct_wet, m_data["area_km2"], versant)
-            slope_m_km = m_data["slope_m_km"]
+            
             ml_model, ml_loaded = get_q10_model()
             q_dict = compute_q10_ml(ml_model, m_data["area_km2"], p_design[10], slope_m_km, e_cal, g_cal, v_cal, p_design) if (ml_loaded and ml_model is not None) else None
-            q_dict_orstom, q_method_orstom = None, None
 
             st.session_state.metrics.update({
                 "p_annuelle_mm": p_annuelle_mm, "p_mensuelles": p_mensuelles, "p_design": p_design,
@@ -916,6 +899,10 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
                 "egv_params": {"E": round(e_cal, 3), "G": round(g_cal, 3), "V": round(v_cal, 3), "Ig_m_km": m_data["slope_m_km"], "P10_mm": round(p_design[10], 1), "Surface_km2": round(m_data["area_km2"], 2)},
             })
             st.session_state.hydro_computed = True
+
+            t_elapsed_p2 = time.perf_counter() - t_phase2_start
+            print(f"[CHRONO] Phase 2 terminée en {t_elapsed_p2:.2f} s")
+
             st.rerun()
     except Exception as e:
         st.error(f"⚠️ Erreur lors de la lecture des ressources distantes : {type(e).__name__}: {e}")
