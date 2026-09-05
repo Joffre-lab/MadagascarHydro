@@ -663,10 +663,9 @@ with col_panel:
                     sc2.metric("Alt. max.", f"{m_data['max_elev']:.0f} m")
                     sc3.metric("Pente globale", f"{m_data['slope_m_km']:.1f} m/km")
 
-                    sc4, sc5, sc6 = st.columns(3)
+                    sc4, sc5 = st.columns(2)
                     sc4.metric("Rectangle équiv.", f"{m_data['l_rect_km']:.1f} km")
                     sc5.metric("Gravelius Kc", f"{m_data['kc']:.2f}")
-                    sc6.metric("Canal principal", f"{m_data['main_channel_len_km']:.1f} km")
 
                     st.markdown("**Occupation du sol**")
                     if not m_data.get("lc_df").empty:
@@ -678,7 +677,7 @@ with col_panel:
                     st.markdown("**Distribution mensuelle typique**")
                     df_m = pd.DataFrame([m_data["p_mensuelles"]], columns=["Jan", "Fév", "Mar", "Avr", "Mai", "Juin", "Juil", "Août", "Sept", "Oct", "Nov", "Déc"])
                     st.dataframe(df_m.style.format("{:.1f}"), hide_index=True, width="stretch")
-                    st.markdown("**Précipitations extrêmes — Pmax 24 h**")
+                    st.markdown("**Pluie max 24h ajustée par la loi de Gumbel**")
                     
                     cp1, cp2 = st.columns(2)
                     cp1.metric("P10", f"{m_data['p_design'][10]:,.0f} mm")
@@ -769,15 +768,24 @@ if do_phase_1:
             effective_acc = max(accumulation_threshold, int(buffer_deg * 25000))
             sub_grid, catchment, sub_fdir, sub_acc, raster_bbox, exp_log = get_dynamic_catchment(target_lon, target_lat, buffer_deg, effective_acc)
             target_epsg = get_madagascar_utm_epsg(target_lon)
-            stream_mask = (sub_acc > effective_acc) & catchment
 
+            stream_mask = ((sub_acc > effective_acc) & catchment).astype(bool)
+            
             try:
                 branches = sub_grid.extract_river_network(sub_fdir, stream_mask)
-                stream_gdf_raw = gpd.GeoDataFrame.from_features(branches).set_crs("EPSG:4326")
-                stream_gdf_proj = stream_gdf_raw.to_crs(epsg=target_epsg)
-                main_channel_len_m = stream_gdf_proj.geometry.length.max()
-                stream_gdf = stream_gdf_proj.to_crs(epsg=4326)
-            except Exception:
+                if len(branches["features"]) > 0:
+                    stream_gdf_raw = gpd.GeoDataFrame.from_features(branches).set_crs("EPSG:4326")
+                    stream_gdf_proj = stream_gdf_raw.to_crs(epsg=target_epsg)
+                    
+                    # Calcul de la longueur maximale du chenal principal
+                    main_channel_len_m = float(stream_gdf_proj.geometry.length.max())
+                    stream_gdf = stream_gdf_proj.to_crs(epsg=4326)
+                else:
+                    stream_gdf = None
+                    main_channel_len_m = 5000.0
+            except Exception as e:
+                # Affichage de l'erreur dans la console Streamlit pour le débogage
+                print(f"Erreur extraction rivieres : {e}")
                 stream_gdf = None
                 main_channel_len_m = 5000.0
 
