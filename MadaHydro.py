@@ -173,7 +173,7 @@ def get_local_raster_mean(gdf_polygon, raster_path, fallback_value, max_dim=512)
         pass
     return fallback_value
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=16, show_spinner=False)
 def extract_local_landcover_cached(gdf_json: str, area_km2: float):
     gdf_polygon = gpd.read_file(io.StringIO(gdf_json))
     fallback = (0.80, 0.80, 0.50, 0.00, False, pd.DataFrame())
@@ -255,7 +255,7 @@ def calibrer_indices_egv(g_raw, v_raw, e_raw, pct_wet, area_km2, versant):
     else: e_cal = e_raw
     return g_raw, v_raw, e_cal
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=32, show_spinner=False)
 def calculate_local_rainfall_cached(gdf_json: str):
     gdf_polygon = gpd.read_file(io.StringIO(gdf_json))
     p_annuelle_mm = get_local_raster_mean(gdf_polygon, ANNUAL_RAINFALL_PATH, 1450.0)
@@ -292,7 +292,11 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
     ymin, ymax = target_lat - initial_buffer, target_lat + initial_buffer
     d8_esri = (64, 128, 1, 2, 4, 8, 16, 32)
     max_iterations = 3
-    expansion_log = []
+
+    sub_grid = None
+    catchment = None
+    sub_fdir = None
+    sub_acc = None
 
     for iteration in range(1, max_iterations + 1):
         bbox = (xmin, ymin, xmax, ymax)
@@ -302,8 +306,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
 
         mask_val = sub_acc > threshold
         if not np.any(mask_val): 
-            del sub_grid, sub_fdir, sub_acc
-            gc.collect()
             raise ValueError(f"Aucun cours d'eau trouvé avec un seuil de {threshold}. Diminuez-le.")
 
         x_snap, y_snap = sub_grid.snap_to_mask(mask_val, (target_lon, target_lat))
@@ -313,7 +315,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
         touch_west, touch_east = np.any(catchment[:, 0:2]), np.any(catchment[:, -2:])
 
         if not (touch_west or touch_east or touch_south or touch_north):
-            expansion_log.append(f"✅ Bassin englobé à l'essai {iteration}.")
             break
 
         step = max(initial_buffer * 0.8, 0.4)
@@ -322,16 +323,18 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
         if touch_south: ymin -= step
         if touch_north: ymax += step
 
-        # Nettoyage entre les itérations
-        del sub_grid, sub_fdir, sub_acc, catchment
-        gc.collect()
+        # 🧹 Nettoyage RAM intermédiaire uniquement si une nouvelle itération va avoir lieu
+        if iteration < max_iterations:
+            del sub_grid, sub_fdir, sub_acc, catchment
+            gc.collect()
+
+    if sub_grid is None or catchment is None:
+        raise ValueError("Impossible de délimiter le bassin versant aux coordonnées indiquées.")
 
     shapes = sub_grid.polygonize(catchment.astype(np.uint8))
     features = [{"geometry": s, "properties": {"id": 1}} for s, v in shapes if v == 1]
     
-    # Extraction propre des variables locales avant libération mémoire
-    fdir_data, acc_data, grid_obj = sub_fdir, sub_acc, sub_grid
-    return grid_obj, catchment, fdir_data, acc_data, features
+    return sub_grid, catchment, sub_fdir, sub_acc, features
 
 def extract_river_network_ondemand(target_lon, target_lat, buffer_deg, threshold):
     """Extraction à la demande du réseau hydrographique pour limiter la RAM."""
@@ -369,7 +372,7 @@ def test_remote_raster(raster_path: str):
 st.set_page_config(layout="wide", page_title="MadaHydro", page_icon="🇲🇬", initial_sidebar_state="expanded")
 APP_VERSION = "HF-COG-STREAM-v3-OPT"
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=8, show_spinner=False)
 def create_shapefile_zip_cached(bassin_json: str, reseau_json: str = None):
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -386,7 +389,7 @@ def create_shapefile_zip_cached(bassin_json: str, reseau_json: str = None):
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=8, show_spinner=False)
 def create_pdf_report_cached(m_data: dict, center_coords: list):
     return create_pdf_report(m_data, center_coords)
 
@@ -420,9 +423,12 @@ def parse_coordinate(coord_str, is_latitude=True):
         raise ValueError("Format invalide")
 
 for _key, _default in [
-    ("last_coords", None), ("hydro_computed", False), ("catchment_gdf", None),
-    ("stream_gdf", None), ("metrics", None), ("center_coords", [-18.7669, 46.8691]),
-    ("map_zoom", 6), ("map_bounds", None), ("is_pro", False),
+    ("last_coords", None), ("pending_coords", None), ("last_click_key", None),
+    ("analysis_requested", False), ("hydro_computed", False), ("catchment_gdf", None),
+    ("stream_gdf", None), ("network_attempted", False), ("network_error", None),
+    ("metrics", None), ("center_coords", [-18.7669, 46.8691]),
+    ("map_center", [-18.7669, 46.8691]), ("map_zoom", 6),
+    ("map_bounds", None), ("is_pro", False),
 ]:
     if _key not in st.session_state: st.session_state[_key] = _default
 
@@ -491,7 +497,6 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.3px; }
             <div class="mh-subtitle">Hydrologie appliquée · Madagascar</div>
         </div>
         <div class="mh-header-spacer"></div>
-        <div class="mh-pill">AI HYDROLOGY</div>
     </div>
     <div class="mh-description">
         Délimitez un bassin versant à partir d'un exutoire, puis explorez ses indicateurs hydrologiques et ses estimations de crue dans un environnement de travail orienté ingénierie.
@@ -512,7 +517,13 @@ st.sidebar.markdown(
 )
 
 with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
-    input_mode = st.radio("Méthode de sélection", ["Clic sur la carte", "Saisie manuelle"], index=0, horizontal=True, label_visibility="collapsed")
+    input_mode = st.radio(
+    "Méthode de sélection",
+    ["Saisie manuelle", "Clic sur la carte"],
+    index=0,
+    horizontal=False,
+    label_visibility="collapsed"
+)
     target_lat, target_lon = None, None
     do_phase_1 = False
 
@@ -524,9 +535,10 @@ with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
             try:
                 target_lat = parse_coordinate(lat_input, is_latitude=True)
                 target_lon = parse_coordinate(lon_input, is_latitude=False)
-                if st.session_state.last_coords != (target_lat, target_lon):
-                    st.session_state.last_coords = (target_lat, target_lon)
-                    do_phase_1 = True
+                st.session_state.pending_coords = (target_lat, target_lon)
+                st.session_state.analysis_requested = True
+                st.session_state.network_attempted = False
+                st.session_state.network_error = None
             except Exception:
                 st.error("Coordonnées invalides.")
     else:
@@ -537,7 +549,7 @@ with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
 
 with st.sidebar.expander("⚙️ 2 · Paramètres de délimitation", expanded=True):
     st.caption("Ces paramètres contrôlent la fenêtre de recherche et le réseau extrait.")
-    buffer_deg = st.slider("Fenêtre initiale (°)", 0.3, 2.5, 0.8, 0.1, help="Augmentez cette valeur pour un bassin très étendu.")
+    buffer_deg = st.slider("Fenêtre initiale (°)", 0.3, 2.5, 0.6, 0.1, help="Augmentez cette valeur pour un bassin très étendu.")
     accumulation_threshold = st.slider("Seuil d'accumulation", 100, 1000, 500, 100, help="Contrôle la densité du réseau.")
 
 with st.sidebar.expander("🗺️ 3 · Affichage de la carte", expanded=False):
@@ -557,7 +569,14 @@ with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
         st.metric("Surface", f"{st.session_state.metrics['area_km2']:,.1f} km²")
 
     if st.button("↺ Réinitialiser l'analyse", width="stretch"):
-        for _k, _v in [("last_coords", None), ("hydro_computed", False), ("catchment_gdf", None), ("stream_gdf", None), ("metrics", None), ("center_coords", [-18.7669, 46.8691]), ("map_zoom", 6), ("map_bounds", None)]:
+        for _k, _v in [
+            ("last_coords", None), ("pending_coords", None), ("last_click_key", None),
+            ("analysis_requested", False), ("hydro_computed", False),
+            ("catchment_gdf", None), ("stream_gdf", None),
+            ("network_attempted", False), ("network_error", None), ("metrics", None),
+            ("center_coords", [-18.7669, 46.8691]), ("map_center", [-18.7669, 46.8691]),
+            ("map_zoom", 6), ("map_bounds", None),
+        ]:
             st.session_state[_k] = _v
         gc.collect()
         st.rerun()
@@ -569,31 +588,12 @@ with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
         except Exception as e:
             st.error(f"Test GDAL échoué : {type(e).__name__}: {e}")
 
-if st.session_state.is_pro:
-    with st.sidebar.expander("⭐ 5 · Licence PRO", expanded=False):
-        st.success("Licence active")
-        st.caption("Les analyses morphologiques, pluviométriques et de crue sont déverrouillées.")
-else:
-    with st.sidebar.expander("🔐 5 · Passer en PRO", expanded=False):
-        st.markdown("**Débloquez l'analyse hydrologique complète.**")
-        st.caption("Occupation du sol · Pluviométrie · Débits de crue · Rapport PDF")
-        st.markdown("[💬 Contacter MadaHydro](https://api.whatsapp.com/send/?phone=327829333)")
-        st.caption("033 42 036 75 · joffrerazafimihary@gmail.com")
-        code_input = st.text_input("Code d'accès", key="unlock_code")
-        if st.button("🔓 Activer l'accès", type="primary", width="stretch"):
-            if code_input.strip() in VALID_PRO_KEYS:
-                st.session_state.is_pro = True
-                st.success("Accès Pro activée.")
-                st.rerun()
-            else:
-                st.error("Code d'accès invalide ou expiré.")
-
 # --- Conteneurs principaux ---
-col_map, col_panel = st.columns([1.7, 1], gap="large")
+col_map, col_panel = st.columns([1.7, 1.5], gap="large")
 
 with col_map:
     st.markdown('<div class="mh-section-title"><span>🗺️</span><div><strong>Carte d’exploration</strong><small>Délimitation interactive du bassin versant</small></div></div>', unsafe_allow_html=True)
-    m = leafmap.Map(center=st.session_state.center_coords, zoom=st.session_state.map_zoom)
+    m = leafmap.Map(center=st.session_state.map_center, zoom=st.session_state.map_zoom)
     try: m.add_basemap(map_basemap)
     except Exception: m.add_basemap("HYBRID")
 
@@ -602,41 +602,71 @@ with col_map:
     
     # Calcul à la demande du réseau hydrographique si l'utilisateur coche la case
     if show_network and st.session_state.catchment_gdf is not None and st.session_state.last_coords is not None:
-        if st.session_state.stream_gdf is None:
+        if st.session_state.stream_gdf is not None and not st.session_state.stream_gdf.empty:
+            m.add_gdf(st.session_state.stream_gdf, layer_name="Réseau hydrographique", style={"color": "#06b6d4", "weight": 2})
+        elif not st.session_state.network_attempted:
+            # Une seule extraction par bassin : un pan/zoom ne relance jamais le calcul.
             with st.spinner("Extraction à la demande du réseau hydrographique..."):
                 lon_e, lat_e = st.session_state.last_coords[1], st.session_state.last_coords[0]
                 eff_acc = max(accumulation_threshold, int(buffer_deg * 25000))
-                st.session_state.stream_gdf = extract_river_network_ondemand(lon_e, lat_e, buffer_deg, eff_acc)
-
-        if st.session_state.stream_gdf is not None and not st.session_state.stream_gdf.empty:
-            m.add_gdf(st.session_state.stream_gdf, layer_name="Réseau hydrographique", style={"color": "#06b6d4", "weight": 2})
+                try:
+                    st.session_state.stream_gdf = extract_river_network_ondemand(lon_e, lat_e, buffer_deg, eff_acc)
+                except Exception as e:
+                    st.session_state.stream_gdf = None
+                    st.session_state.network_error = f"{type(e).__name__}: {e}"
+                st.session_state.network_attempted = True
+            if st.session_state.stream_gdf is not None and not st.session_state.stream_gdf.empty:
+                m.add_gdf(st.session_state.stream_gdf, layer_name="Réseau hydrographique", style={"color": "#06b6d4", "weight": 2})
         
     if st.session_state.map_bounds is not None:
         m.fit_bounds(st.session_state.map_bounds)
         st.session_state.map_bounds = None 
 
-    map_data = st_folium(m, height=map_height, width="100%", key="madagascar_map")
-    st.caption("💡 Mode clic : cliquez sur le point d’exutoire. Mode manuel : utilisez la barre latérale.")
+    # IMPORTANT : seuls les clics doivent remonter à Streamlit.
+    # En limitant returned_objects à "last_clicked", les événements Leaflet
+    # de pan/zoom (center, zoom, bounds) ne modifient pas la valeur du composant
+    # et ne provoquent donc pas de rerun Streamlit.
+    map_data = st_folium(
+    m,
+    height=map_height,
+    width="100%",
+    key="madagascar_map",
+    returned_objects=["last_clicked"],
+    return_on_hover=False,
+)
+    st.caption("💡 Cliquez sur un exutoire pour lancer la délimitation. Le pan et le zoom n’interrompent pas le calcul.")
 
-if input_mode == "Clic sur la carte" and map_data and map_data.get("last_clicked"):
-    lat = map_data["last_clicked"]["lat"]
-    lon = map_data["last_clicked"]["lng"]
-    if st.session_state.last_coords != (lat, lon):
-        st.session_state.last_coords = (lat, lon)
-        target_lat, target_lon = lat, lon
-        do_phase_1 = True
+# Seul un nouveau clic sur la carte crée une demande de délimitation.
+# Le pan/zoom n'est volontairement pas lu ici : il ne provoque aucun rerun
+# avec returned_objects=["last_clicked"].
+
+# Seul un nouveau clic sur la carte crée une demande de délimitation.
+# Le pan/zoom n'est volontairement pas lu ici : il ne provoque aucun rerun
+# avec returned_objects=["last_clicked"].
+if map_data and map_data.get("last_clicked"):
+    lat = float(map_data["last_clicked"]["lat"])
+    lon = float(map_data["last_clicked"]["lng"])
+    click_key = (round(lat, 7), round(lon, 7))
+
+    if input_mode == "Clic sur la carte":
+        # Déclenchement uniquement s'il s'agit d'un VÉRITABLE nouveau clic
+        if st.session_state.get("last_click_key") != click_key:
+            st.session_state.last_click_key = click_key
+            st.session_state.last_coords = (lat, lon)
+            st.session_state.pending_coords = (lat, lon)
+            st.session_state.analysis_requested = True
+            st.session_state.network_attempted = False
+            st.session_state.network_error = None
+    else:
+        # En mode Saisie manuelle : mémoriser la clé du clic sans activer analysis_requested
+        st.session_state.last_click_key = click_key
 
 with col_panel:
     st.markdown('<div class="mh-section-title"><span>📊</span><div><strong>Analyse</strong><small>Résultats et indicateurs</small></div></div>', unsafe_allow_html=True)
 
     if st.session_state.metrics is None:
         with st.container(border=True):
-            st.markdown("### 🎯 Commencez par un exutoire")
-            st.write("La plateforme calculera automatiquement la géométrie du bassin à partir des données topographiques disponibles.")
-            st.info("**Étape 1** — Sélectionnez un point sur la carte ou saisissez les coordonnées dans la barre latérale.")
-            c1, c2 = st.columns(2)
-            c1.metric("Statut", "Prêt")
-            c2.metric("Mode", "PRO" if st.session_state.is_pro else "FREE")
+            st.write("La plateforme calculera automatiquement la géométrie du bassin à partir du Modèle Numérique de Surface.")
     else:
         m_data = st.session_state.metrics
         with st.container(border=True):
@@ -655,7 +685,7 @@ with col_panel:
 
         if st.session_state.is_pro:
             if st.session_state.get("hydro_computed", False):
-                with st.expander("🌍 Caractéristiques du bassin", expanded=True):
+                with st.expander("🌍 Caractéristiques du bassin", expanded=False):
                     sc1, sc2, sc3 = st.columns(3)
                     sc1.metric("Alt. min.", f"{m_data['min_elev']:.0f} m")
                     sc2.metric("Alt. max.", f"{m_data['max_elev']:.0f} m")
@@ -684,7 +714,7 @@ with col_panel:
                     cp3.metric("P50", f"{m_data['p_design'][50]:,.0f} mm")
                     cp4.metric("P100", f"{m_data['p_design'][100]:,.0f} mm")
 
-                with st.expander("⚡ Débits de crue · IA & Empirique", expanded=True):
+                with st.expander("⚡ Débits de crue · IA ", expanded=False):
                     in_domain = m_data.get("in_domain", False)
                     q_ml = m_data.get("q_dict")
                     st.markdown("**Estimation Machine Learning — modèle global**")
@@ -732,6 +762,7 @@ with col_panel:
                 with st.expander("💳 Activer la fonctionalité complet", expanded=False):
                     st.markdown("**Accès pour projets académiques, bureaux d'études et applications professionnelles.**")
                     st.markdown("💬 [Contacter MadaHydro](https://api.whatsapp.com/send/?phone=327829333)")
+                    st.markdown("✉️ [Envoyer un e-mail](https://mail.google.com/mail/?view=cm&fs=1&to=joffrerazafimihary@gmail.com&su=Demande%20d%27acces%20MadaHydro)")
                     code_input = st.text_input("Code d'accès", key="unlock_code_panel")
                     if st.button("🔓 Accèder", type="primary", width="stretch", key="activate_panel"):
                         if code_input.strip() in VALID_PRO_KEYS:
@@ -741,7 +772,7 @@ with col_panel:
                         else: st.error("Code d'accès invalide ou expiré.")
 
 st.markdown('<div class="mh-help-wrap">', unsafe_allow_html=True)
-with st.expander("📖 Guide d'utilisation · MadaHydro Watershed Explorer", expanded=False):
+with st.expander("📖 Guide d'utilisation", expanded=False):
     st.markdown("""
     ### Utilisation en 4 étapes
 
@@ -760,10 +791,12 @@ with st.expander("📖 Guide d'utilisation · MadaHydro Watershed Explorer", exp
 st.markdown('</div>', unsafe_allow_html=True)
 
 # --- 5. Pipelines d'Exécution Optimisés ---
+do_phase_1 = bool(st.session_state.get("analysis_requested", False) and st.session_state.get("pending_coords"))
 if do_phase_1:
     try:
         t_phase1_start = time.perf_counter()
         with st.spinner("1/2 Délimitation et extraction géométrique..."):
+            target_lat, target_lon = st.session_state.pending_coords
             effective_acc = max(accumulation_threshold, int(buffer_deg * 25000))
             grid_obj, catchment, sub_fdir, sub_acc, features = get_dynamic_catchment(target_lon, target_lat, buffer_deg, effective_acc)
             target_epsg = get_madagascar_utm_epsg(target_lon)
@@ -775,7 +808,7 @@ if do_phase_1:
             if features:
                 gdf_raw = gpd.GeoDataFrame.from_features(features).set_crs("EPSG:4326")
                 gdf_proj = gdf_raw.to_crs(epsg=target_epsg)
-                gdf_proj["geometry"] = gdf_proj.geometry.simplify(tolerance=60.0, preserve_topology=True).buffer(40.0, join_style=1).buffer(-40.0, join_style=1)
+                gdf_proj["geometry"] = gdf_proj.geometry.simplify(tolerance=50.0, preserve_topology=True)
 
                 area_km2 = float(gdf_proj.geometry.area.sum() / 1e6)
                 perimeter_km = float(gdf_proj.geometry.length.sum() / 1000.0)
@@ -805,8 +838,16 @@ if do_phase_1:
                 "main_channel_len_km": round(l_rect_km, 2),
                 "target_epsg": target_epsg,
             }
+            st.session_state.last_coords = (target_lat, target_lon)
+            st.session_state.last_click_key = (round(target_lat, 7), round(target_lon, 7))
+            st.session_state.pending_coords = None
+            st.session_state.analysis_requested = False
+            st.session_state.network_attempted = False
+            st.session_state.network_error = None
+            st.session_state.stream_gdf = None
             st.session_state.hydro_computed = False
             st.session_state.center_coords = [(miny + maxy) / 2.0, (minx + maxx) / 2.0]
+            st.session_state.map_center = list(st.session_state.center_coords)
             
             t_elapsed = time.perf_counter() - t_phase1_start
             print(f"[CHRONO] Phase 1 terminée en {t_elapsed:.2f} s")
@@ -815,7 +856,8 @@ if do_phase_1:
 
     except Exception as e:
         st.error(f"⚠️ Erreur lors de la délimitation : {e}")
-        st.session_state.last_coords = None
+        st.session_state.analysis_requested = False
+        st.session_state.pending_coords = None
 
 if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and not st.session_state.get("hydro_computed", False)):
     try:
