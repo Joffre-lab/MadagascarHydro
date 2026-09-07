@@ -425,7 +425,7 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 break
 
             # Expansion progressive, uniquement dans les directions nécessaires
-            step = max(float(initial_buffer) * 0.6, 0.4)
+            step = max(float(initial_buffer) * 1.2, 1)
 
             if np.any(catchment[:, :mx]):
                 xmin -= step
