@@ -391,13 +391,13 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 xytype="coordinate",
             )
 
-            # 🔍 Cast explicite en numpy array natif pour éviter l'ambiguïté de vérité PySheds
+            # 🔍 Correction stricte dans get_dynamic_catchment
             touch_north = bool(np.asarray(current_catchment[0:4, :]).any())
             touch_south = bool(np.asarray(current_catchment[-4:, :]).any())
             touch_west  = bool(np.asarray(current_catchment[:, 0:4]).any())
             touch_east  = bool(np.asarray(current_catchment[:, -4:]).any())
-            touches_boundary = touch_north or touch_south or touch_west or touch_east
 
+            touches_boundary = touch_north or touch_south or touch_west or touch_east
             # Si le bassin est totalement englobé
             if not touches_boundary or iteration == MAX_DELINEATION_ITERATIONS:
                 sub_grid = current_grid
