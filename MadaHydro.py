@@ -16,8 +16,8 @@ os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
 
 # Cache VSI limité pour éviter une explosion de RAM sur Streamlit Cloud.
 os.environ.setdefault("VSI_CACHE", "TRUE")
-os.environ.setdefault("VSI_CACHE_SIZE", "33554432")
-os.environ.setdefault("GDAL_CACHEMAX", "64")
+os.environ.setdefault("VSI_CACHE_SIZE", "16777216")
+os.environ.setdefault("GDAL_CACHEMAX", "32")
 os.environ.setdefault("GDAL_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -67,6 +67,12 @@ WORLD_COVER_PATHS    = [
 
 MODEL_HF_FILENAME = "Q10_Model_Prediction/Q10_global_logq10.joblib"
 VALID_PRO_KEYS = ["HYDRO-PRO-2026", "MADA-HYDRO-PRO", "EXUTOIRE-2026"]
+
+# Limite fonctionnelle pour protéger Streamlit Cloud sans modifier
+# la résolution des rasters ni la logique hydrologique.
+MAX_CATCHMENT_AREA_KM2 = 20_000.0
+MAX_DELINEATION_ITERATIONS = 3
+
 
 # --- Modèle ML & Classes ---
 class Q10FeatureEngineer:
@@ -132,8 +138,19 @@ def detect_versant(lat, lon):
             return "Hautes_Terres"
 
 # --- Fonctions raster & calculs mis en CACHE ---
-def get_local_raster_mean(gdf_polygon, raster_path, fallback_value, max_dim=512):
+@st.cache_data(ttl=1800, max_entries=64, show_spinner=False)
+def get_local_raster_mean_cached(gdf_json: str, raster_path: str, fallback_value: float, max_dim: int = 512):
+    """Lit une statistique raster locale avec sortie scalaire uniquement.
+
+    Le cache ne conserve jamais le tableau raster : seulement la moyenne finale.
+    Cela limite fortement la RAM tout en évitant les lectures répétées pour une
+    même géométrie.
+    """
+    data = None
+    inside = None
+    vals = None
     try:
+        gdf_polygon = gpd.read_file(io.StringIO(gdf_json))
         with rasterio.open(raster_path) as src:
             gdf_proj = gdf_polygon.to_crs(src.crs)
             shapes = [geom for geom in gdf_proj.geometry if geom is not None and not geom.is_empty]
@@ -153,8 +170,10 @@ def get_local_raster_mean(gdf_polygon, raster_path, fallback_value, max_dim=512)
             ).astype(np.float32, copy=False)
 
             out_transform = window_transform(win, src.transform) * Affine.scale(
-                win.width / out_w, win.height / out_h
+                win.width / out_w,
+                win.height / out_h,
             )
+
             inside = geometry_mask(
                 shapes,
                 out_shape=(out_h, out_w),
@@ -166,12 +185,24 @@ def get_local_raster_mean(gdf_polygon, raster_path, fallback_value, max_dim=512)
             valid = inside & np.isfinite(data) & (data > 0)
             if nodata is not None:
                 valid &= data != nodata
+
             vals = data[valid]
             if vals.size:
                 return float(np.mean(vals))
+
     except Exception:
-        pass
+        return fallback_value
+    finally:
+        if vals is not None:
+            del vals
+        if inside is not None:
+            del inside
+        if data is not None:
+            del data
+        gc.collect()
+
     return fallback_value
+
 
 @st.cache_data(ttl=1800, max_entries=16, show_spinner=False)
 def extract_local_landcover_cached(gdf_json: str, area_km2: float):
@@ -191,6 +222,7 @@ def extract_local_landcover_cached(gdf_json: str, area_km2: float):
     total_pixel_counts = {}
 
     for r_path in raster_files:
+        data = inside = valid_pixels = unique = counts = None
         try:
             with rasterio.open(r_path) as src:
                 gdf_proj = gdf_polygon.to_crs(src.crs)
@@ -226,6 +258,18 @@ def extract_local_landcover_cached(gdf_json: str, area_km2: float):
                     continue
         except Exception:
             continue
+        finally:
+            if counts is not None:
+                del counts
+            if unique is not None:
+                del unique
+            if valid_pixels is not None:
+                del valid_pixels
+            if inside is not None:
+                del inside
+            if data is not None:
+                del data
+            gc.collect()
 
     total_pixels = sum(total_pixel_counts.values())
     if total_pixels == 0:
@@ -257,9 +301,8 @@ def calibrer_indices_egv(g_raw, v_raw, e_raw, pct_wet, area_km2, versant):
 
 @st.cache_data(ttl=1800, max_entries=32, show_spinner=False)
 def calculate_local_rainfall_cached(gdf_json: str):
-    gdf_polygon = gpd.read_file(io.StringIO(gdf_json))
-    p_annuelle_mm = get_local_raster_mean(gdf_polygon, ANNUAL_RAINFALL_PATH, 1450.0)
-    p10_mm        = get_local_raster_mean(gdf_polygon, P10_RAINFALL_PATH, 142.0)
+    p_annuelle_mm = get_local_raster_mean_cached(gdf_json, ANNUAL_RAINFALL_PATH, 1450.0)
+    p10_mm        = get_local_raster_mean_cached(gdf_json, P10_RAINFALL_PATH, 142.0)
 
     monthly_ratios = [0.26, 0.22, 0.16, 0.05, 0.02, 0.01, 0.01, 0.01, 0.01, 0.03, 0.08, 0.14]
     p_mensuelles = [float(p_annuelle_mm * ratio) for ratio in monthly_ratios]
@@ -288,53 +331,168 @@ def compute_q10_ml(model, area_km2, p10_mm, slope_m_km, e_cal, g_cal, v_cal, p_d
 
 # --- Moteur d'Auto-Expansion Dynamique (Max 3 iterations) ---
 def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
-    xmin, xmax = target_lon - initial_buffer, target_lon + initial_buffer
-    ymin, ymax = target_lat - initial_buffer, target_lat + initial_buffer
+    """Délimitation exacte par fenêtre distante, avec auto-expansion bornée.
+
+    Optimisations sans baisse de précision :
+      - conserve la résolution native de FlowDir/FlowAcc ;
+      - lecture uniquement de la fenêtre utile via /vsicurl/ ;
+      - maximum de 3 itérations ;
+      - expansion anisotrope uniquement sur les bords touchés ;
+      - nettoyage explicite des grands tableaux entre les essais ;
+      - les objets de la dernière itération sont toujours conservés.
+    """
+    xmin = target_lon - initial_buffer
+    xmax = target_lon + initial_buffer
+    ymin = target_lat - initial_buffer
+    ymax = target_lat + initial_buffer
+
     d8_esri = (64, 128, 1, 2, 4, 8, 16, 32)
-    max_iterations = 3
 
     sub_grid = None
-    catchment = None
     sub_fdir = None
     sub_acc = None
+    catchment = None
 
-    for iteration in range(1, max_iterations + 1):
+    for iteration in range(1, MAX_DELINEATION_ITERATIONS + 1):
         bbox = (xmin, ymin, xmax, ymax)
-        sub_grid = Grid.from_raster(FLOW_DIR_PATH, window=bbox)
-        sub_fdir = sub_grid.read_raster(FLOW_DIR_PATH, window=bbox, d8_mapping=d8_esri, dtype=np.uint8)
-        sub_acc = sub_grid.read_raster(FLOW_ACC_PATH, window=bbox, dtype=np.float32)
 
-        mask_val = sub_acc > threshold
-        if not np.any(mask_val): 
-            raise ValueError(f"Aucun cours d'eau trouvé avec un seuil de {threshold}. Diminuez-le.")
+        current_grid = None
+        current_fdir = None
+        current_acc = None
+        current_catchment = None
 
-        x_snap, y_snap = sub_grid.snap_to_mask(mask_val, (target_lon, target_lat))
-        catchment = sub_grid.catchment(x=x_snap, y=y_snap, fdir=sub_fdir, d8_mapping=d8_esri, xytype="coordinate")
+        try:
+            current_grid = Grid.from_raster(FLOW_DIR_PATH, window=bbox)
 
-        touch_north, touch_south = np.any(catchment[0:2, :]), np.any(catchment[-2:, :])
-        touch_west, touch_east = np.any(catchment[:, 0:2]), np.any(catchment[:, -2:])
+            # Ne pas sous-échantillonner FlowDir : cela modifierait la topologie.
+            current_fdir = current_grid.read_raster(
+                FLOW_DIR_PATH,
+                window=bbox,
+                d8_mapping=d8_esri,
+                dtype=np.uint8,
+            )
 
-        if not (touch_west or touch_east or touch_south or touch_north):
-            break
+            # Conserver float32 pour ne pas altérer les valeurs du raster source.
+            current_acc = current_grid.read_raster(
+                FLOW_ACC_PATH,
+                window=bbox,
+                dtype=np.float32,
+            )
 
-        step = max(initial_buffer * 0.8, 0.4)
-        if touch_west: xmin -= step
-        if touch_east: xmax += step
-        if touch_south: ymin -= step
-        if touch_north: ymax += step
+            stream_mask = current_acc > threshold
+            if not np.any(stream_mask):
+                raise ValueError(
+                    f"Aucun cours d'eau trouvé avec un seuil d'accumulation de {threshold}. "
+                    "Diminuez le seuil."
+                )
 
-        # 🧹 Nettoyage RAM intermédiaire uniquement si une nouvelle itération va avoir lieu
-        if iteration < max_iterations:
-            del sub_grid, sub_fdir, sub_acc, catchment
+            x_snap, y_snap = current_grid.snap_to_mask(
+                stream_mask,
+                (target_lon, target_lat),
+            )
+
+            current_catchment = current_grid.catchment(
+                x=x_snap,
+                y=y_snap,
+                fdir=current_fdir,
+                d8_mapping=d8_esri,
+                xytype="coordinate",
+            )
+
+            touch_north = bool(np.any(current_catchment[0:2, :]))
+            touch_south = bool(np.any(current_catchment[-2:, :]))
+            touch_west = bool(np.any(current_catchment[:, 0:2]))
+            touch_east = bool(np.any(current_catchment[:, -2:]))
+            touches_boundary = touch_north or touch_south or touch_west or touch_east
+
+            # Bassin complètement contenu : on conserve cette itération.
+            if not touches_boundary:
+                sub_grid = current_grid
+                sub_fdir = current_fdir
+                sub_acc = current_acc
+                catchment = current_catchment
+                current_grid = current_fdir = current_acc = current_catchment = None
+                break
+
+            # Dernière itération : surtout NE PAS supprimer les objets.
+            if iteration == MAX_DELINEATION_ITERATIONS:
+                sub_grid = current_grid
+                sub_fdir = current_fdir
+                sub_acc = current_acc
+                catchment = current_catchment
+                current_grid = current_fdir = current_acc = current_catchment = None
+                break
+
+            # Expansion modérée, uniquement dans les directions touchées.
+            step = max(float(initial_buffer) * 0.8, 0.4)
+            if touch_west:
+                xmin -= step
+            if touch_east:
+                xmax += step
+            if touch_south:
+                ymin -= step
+            if touch_north:
+                ymax += step
+
+        finally:
+            if current_catchment is not None:
+                del current_catchment
+            if current_acc is not None:
+                del current_acc
+            if current_fdir is not None:
+                del current_fdir
+            if current_grid is not None:
+                del current_grid
             gc.collect()
 
     if sub_grid is None or catchment is None:
-        raise ValueError("Impossible de délimiter le bassin versant aux coordonnées indiquées.")
+        raise ValueError(
+            "Impossible de délimiter le bassin versant aux coordonnées indiquées."
+        )
 
-    shapes = sub_grid.polygonize(catchment.astype(np.uint8))
-    features = [{"geometry": s, "properties": {"id": 1}} for s, v in shapes if v == 1]
-    
+    # Polygonisation exacte du masque final. On ne réduit pas la résolution,
+    # afin de préserver la géométrie hydrologique.
+    catchment_u8 = catchment.astype(np.uint8, copy=False)
+    try:
+        shapes = sub_grid.polygonize(catchment_u8)
+        features = [
+            {"geometry": s, "properties": {"id": 1}}
+            for s, v in shapes
+            if v == 1
+        ]
+    finally:
+        del catchment_u8
+        gc.collect()
+
+    if not features:
+        raise ValueError("Aucune géométrie de bassin n'a pu être extraite.")
+
     return sub_grid, catchment, sub_fdir, sub_acc, features
+
+
+@st.cache_data(ttl=900, max_entries=8, show_spinner=False)
+def delineate_catchment_geometry_cached(target_lon: float, target_lat: float, initial_buffer: float, threshold: int):
+    """Cache uniquement la géométrie finale ; jamais FlowDir/FlowAcc."""
+    grid_obj = catchment = sub_fdir = sub_acc = None
+    try:
+        grid_obj, catchment, sub_fdir, sub_acc, features = get_dynamic_catchment(
+            target_lon,
+            target_lat,
+            initial_buffer,
+            threshold,
+        )
+        return features
+    finally:
+        if sub_acc is not None:
+            del sub_acc
+        if sub_fdir is not None:
+            del sub_fdir
+        if catchment is not None:
+            del catchment
+        if grid_obj is not None:
+            del grid_obj
+        gc.collect()
+
 
 def extract_river_network_ondemand(target_lon, target_lat, buffer_deg, threshold):
     """Extraction à la demande du réseau hydrographique pour limiter la RAM."""
@@ -370,7 +528,22 @@ def test_remote_raster(raster_path: str):
 
 # --- 3. Configuration & State ---
 st.set_page_config(layout="wide", page_title="MadaHydro", page_icon="🇲🇬", initial_sidebar_state="expanded")
-APP_VERSION = "HF-COG-STREAM-v3-OPT"
+APP_VERSION = "HF-COG-STREAM-v3-RAM25K"
+
+
+def show_recovery_message(exc, context="analyse"):
+    """Message utile pour les erreurs récupérables ; les OOM système restent non capturables."""
+    msg = str(exc).lower()
+    if isinstance(exc, MemoryError) or "out of memory" in msg or "cannot allocate" in msg:
+        st.error(
+            "⚠️ MadaHydro n’a pas pu terminer cette analyse faute de mémoire disponible. "
+            "Réduisez la fenêtre de recherche ou relancez l’analyse après un redémarrage de l’application."
+        )
+    elif "25,000" in str(exc) or "25 000" in str(exc) or "25000" in msg:
+        st.warning(str(exc))
+    else:
+        st.error(f"⚠️ MadaHydro n’a pas pu terminer la phase {context}. {exc}")
+
 
 @st.cache_data(ttl=3600, max_entries=8, show_spinner=False)
 def create_shapefile_zip_cached(bassin_json: str, reseau_json: str = None):
@@ -549,8 +722,32 @@ with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
 
 with st.sidebar.expander("⚙️ 2 · Paramètres de délimitation", expanded=True):
     st.caption("Ces paramètres contrôlent la fenêtre de recherche et le réseau extrait.")
-    buffer_deg = st.slider("Fenêtre initiale (°)", 0.3, 2.5, 0.6, 0.1, help="Augmentez cette valeur pour un bassin très étendu.")
-    accumulation_threshold = st.slider("Seuil d'accumulation", 100, 1000, 500, 100, help="Contrôle la densité du réseau.")
+    buffer_deg = st.slider(
+    "Fenêtre initiale (°)",
+    min_value=0.30,
+    max_value=1.20,
+    value=0.50,
+    step=0.05,
+    help=(
+        "Correspondance recommandée selon la surface du bassin :\n\n"
+        "• **0.30°** : Petit / Micro-bassin (≤ 100 km²)\n"
+        "• **0.50° - 0.60°** : Bassin moyen (100 à 5 000 km²)\n"
+        "• **0.80° - 1.20°** : Grand bassin (5 000 à 20 000 km² max)"
+    )
+)
+    accumulation_threshold = st.slider(
+    "Seuil d'accumulation",
+    min_value=100,
+    max_value=15000,
+    value=200,
+    step=100,
+    help=(
+        "Sensibilité d'extraction du cours d'eau :\n\n"
+        "• **100 - 500** : Ravines et ruisseaux (S ≤ 100 km²)\n"
+        "• **1 000 - 5 000** : Rivières secondaires (100 à 5 000 km²)\n"
+        "• **10 000+** : Fleuves principaux (S > 10 000 km²)"
+    )
+)
 
 with st.sidebar.expander("🗺️ 3 · Affichage de la carte", expanded=False):
     map_basemap = st.selectbox("Fond cartographique", ["HYBRID", "SATELLITE", "ROADMAP", "TERRAIN"], index=0)
@@ -714,13 +911,13 @@ with col_panel:
                     cp3.metric("P50", f"{m_data['p_design'][50]:,.0f} mm")
                     cp4.metric("P100", f"{m_data['p_design'][100]:,.0f} mm")
 
-                with st.expander("⚡ Débits de crue · IA ", expanded=False):
+                with st.expander("⚡ Débits de crue de projet (Q_T)· Modélisation", expanded=False):
                     in_domain = m_data.get("in_domain", False)
                     q_ml = m_data.get("q_dict")
-                    st.markdown("**Estimation Machine Learning — modèle global**")
+                    st.markdown("**Prédicteur multivarié par apprentissage supervisé (Gradient Boosting)**")
                     
                     if in_domain and q_ml is not None:
-                        st.success(f"🤖 Modèle ML global actif · Versant : {m_data['versant']}")
+                        st.success(f"🤖 Modèle d'apprentissage automatique actif · Versant : {m_data['versant']}")
                         
                         cq1, cq2 = st.columns(2)
                         cq1.metric("Q10", f"{q_ml[10]:,.1f} m³/s")
@@ -798,11 +995,13 @@ if do_phase_1:
         with st.spinner("1/2 Délimitation et extraction géométrique..."):
             target_lat, target_lon = st.session_state.pending_coords
             effective_acc = max(accumulation_threshold, int(buffer_deg * 25000))
-            grid_obj, catchment, sub_fdir, sub_acc, features = get_dynamic_catchment(target_lon, target_lat, buffer_deg, effective_acc)
+            features = delineate_catchment_geometry_cached(
+                round(float(target_lon), 6),
+                round(float(target_lat), 6),
+                round(float(buffer_deg), 2),
+                int(effective_acc),
+            )
             target_epsg = get_madagascar_utm_epsg(target_lon)
-
-            # Libération immédiate des lourds rasters PySheds
-            del grid_obj, catchment, sub_fdir, sub_acc
             gc.collect()
 
             if features:
@@ -811,6 +1010,14 @@ if do_phase_1:
                 gdf_proj["geometry"] = gdf_proj.geometry.simplify(tolerance=50.0, preserve_topology=True)
 
                 area_km2 = float(gdf_proj.geometry.area.sum() / 1e6)
+
+                if area_km2 > MAX_CATCHMENT_AREA_KM2:
+                    raise ValueError(
+                        f"Le bassin délimité fait {area_km2:,.0f} km², au-delà de la "
+                        f"limite de {MAX_CATCHMENT_AREA_KM2:,.0f} km² fixée pour protéger "
+                        "les ressources de l'application."
+                    )
+
                 perimeter_km = float(gdf_proj.geometry.length.sum() / 1000.0)
                 gdf = gdf_proj.to_crs(epsg=4326)
 
@@ -855,7 +1062,7 @@ if do_phase_1:
             st.rerun()
 
     except Exception as e:
-        st.error(f"⚠️ Erreur lors de la délimitation : {e}")
+        show_recovery_message(e, "de délimitation")
         st.session_state.analysis_requested = False
         st.session_state.pending_coords = None
 
@@ -918,7 +1125,27 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
             tc_passini = compute_passini_tc(m_data["area_km2"], m_data["l_rect_km"], slope_m_km)
             m_data["tc_passini_hours"] = tc_passini
 
-            del dem_arr, valid_elevs
+            # Libération explicite de tous les tableaux DEM temporaires.
+            try:
+                del dem_arr
+            except NameError:
+                pass
+            try:
+                del dem_inside
+            except NameError:
+                pass
+            try:
+                del valid_mask
+            except NameError:
+                pass
+            try:
+                del valid_elevs
+            except NameError:
+                pass
+            try:
+                del pos_elevs
+            except NameError:
+                pass
             gc.collect()
 
             catchment_json = st.session_state.catchment_gdf.to_json()
