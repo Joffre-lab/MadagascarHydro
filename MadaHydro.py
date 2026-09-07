@@ -67,7 +67,7 @@ WORLD_COVER_PATHS    = [
 ]
 
 MODEL_HF_FILENAME = "Q10_Model_Prediction/Q10_global_logq10.joblib"
-VALID_PRO_KEYS = ["HYDRO-PRO-2026", "MADA-HYDRO-PRO", "EXUTOIRE-2026"]
+VALID_PRO_KEYS = ["HYDRO-PRO-2026", "MADA-HYDRO-PRO", "EXUTOIRE-PRO-2026"]
 
 # Limite fonctionnelle pour protéger Streamlit Cloud sans modifier
 # la résolution des rasters ni la logique hydrologique.
