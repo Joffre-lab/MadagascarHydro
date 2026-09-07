@@ -28,6 +28,7 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import time
 import gc
+import psutil
 import pandas as pd
 import leafmap.foliumap as leafmap
 from streamlit_folium import st_folium
@@ -329,24 +330,17 @@ def compute_q10_ml(model, area_km2, p10_mm, slope_m_km, e_cal, g_cal, v_cal, p_d
     for T in [25, 50, 100]: q_dict[T] = Q10 * (p_design[T] / p10) ** 1.39
     return q_dict
 
-# --- Moteur d'Auto-Expansion Dynamique (Max 3 iterations) ---
+# --- Moteur d'Auto-Expansion Dynamique (Optimisé & Performant) ---
 def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
-    """Délimitation exacte par fenêtre distante, avec auto-expansion bornée.
-
-    Optimisations sans baisse de précision :
-      - conserve la résolution native de FlowDir/FlowAcc ;
-      - lecture uniquement de la fenêtre utile via /vsicurl/ ;
-      - maximum de 3 itérations ;
-      - expansion anisotrope uniquement sur les bords touchés ;
-      - nettoyage explicite des grands tableaux entre les essais ;
-      - les objets de la dernière itération sont toujours conservés.
-    """
+    """Délimitation exacte avec auto-expansion rapide et nettoyage mémoire RAM."""
+    
     xmin = target_lon - initial_buffer
     xmax = target_lon + initial_buffer
     ymin = target_lat - initial_buffer
     ymax = target_lat + initial_buffer
 
     d8_esri = (64, 128, 1, 2, 4, 8, 16, 32)
+    MAX_DELINEATION_ITERATIONS = 3
 
     sub_grid = None
     sub_fdir = None
@@ -364,7 +358,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
         try:
             current_grid = Grid.from_raster(FLOW_DIR_PATH, window=bbox)
 
-            # Ne pas sous-échantillonner FlowDir : cela modifierait la topologie.
             current_fdir = current_grid.read_raster(
                 FLOW_DIR_PATH,
                 window=bbox,
@@ -372,7 +365,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 dtype=np.uint8,
             )
 
-            # Conserver float32 pour ne pas altérer les valeurs du raster source.
             current_acc = current_grid.read_raster(
                 FLOW_ACC_PATH,
                 window=bbox,
@@ -399,14 +391,15 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 xytype="coordinate",
             )
 
-            touch_north = bool(np.any(current_catchment[0:2, :]))
-            touch_south = bool(np.any(current_catchment[-2:, :]))
-            touch_west = bool(np.any(current_catchment[:, 0:2]))
-            touch_east = bool(np.any(current_catchment[:, -2:]))
+            # Marge de détection de 4 pixels pour éliminer les bords NoData
+            touch_north = bool(np.any(current_catchment[0:4, :]))
+            touch_south = bool(np.any(current_catchment[-4:, :]))
+            touch_west  = bool(np.any(current_catchment[:, 0:4]))
+            touch_east  = bool(np.any(current_catchment[:, -4:]))
             touches_boundary = touch_north or touch_south or touch_west or touch_east
 
-            # Bassin complètement contenu : on conserve cette itération.
-            if not touches_boundary:
+            # Si le bassin est totalement englobé
+            if not touches_boundary or iteration == MAX_DELINEATION_ITERATIONS:
                 sub_grid = current_grid
                 sub_fdir = current_fdir
                 sub_acc = current_acc
@@ -414,17 +407,11 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 current_grid = current_fdir = current_acc = current_catchment = None
                 break
 
-            # Dernière itération : surtout NE PAS supprimer les objets.
-            if iteration == MAX_DELINEATION_ITERATIONS:
-                sub_grid = current_grid
-                sub_fdir = current_fdir
-                sub_acc = current_acc
-                catchment = current_catchment
-                current_grid = current_fdir = current_acc = current_catchment = None
-                break
+            # 🚀 PAS D'EXPANSION PUISSANT 
+            # Garantit un saut d'au moins 0.8° à 1.0° dès le premier dépassement
+            step = max(float(initial_buffer) * 1.2, 0.8)
+            print(f"[Auto-Expansion] Itération {iteration}: bassin coupé, agrandissement de la fenêtre (+{step:.2f}°)")
 
-            # Expansion modérée, uniquement dans les directions touchées.
-            step = max(float(initial_buffer) * 0.8, 0.4)
             if touch_west:
                 xmin -= step
             if touch_east:
@@ -435,40 +422,18 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 ymax += step
 
         finally:
-            if current_catchment is not None:
-                del current_catchment
-            if current_acc is not None:
-                del current_acc
-            if current_fdir is not None:
-                del current_fdir
-            if current_grid is not None:
-                del current_grid
+            # Purge stricte des objets temporaires pour éviter les fuites RAM
+            if current_catchment is not None: del current_catchment
+            if current_acc is not None: del current_acc
+            if current_fdir is not None: del current_fdir
+            if current_grid is not None: del current_grid
             gc.collect()
 
     if sub_grid is None or catchment is None:
-        raise ValueError(
-            "Impossible de délimiter le bassin versant aux coordonnées indiquées."
-        )
+        raise ValueError("Impossible de délimiter le bassin versant aux coordonnées indiquées.")
 
-    # Polygonisation exacte du masque final. On ne réduit pas la résolution,
-    # afin de préserver la géométrie hydrologique.
-    catchment_u8 = catchment.astype(np.uint8, copy=False)
-    try:
-        shapes = sub_grid.polygonize(catchment_u8)
-        features = [
-            {"geometry": s, "properties": {"id": 1}}
-            for s, v in shapes
-            if v == 1
-        ]
-    finally:
-        del catchment_u8
-        gc.collect()
-
-    if not features:
-        raise ValueError("Aucune géométrie de bassin n'a pu être extraite.")
-
-    return sub_grid, catchment, sub_fdir, sub_acc, features
-
+    sub_dem = sub_grid.read_raster(DEM_PATH, window=bbox, dtype=np.float32)
+    return sub_grid, catchment, sub_fdir, sub_acc, sub_dem
 
 @st.cache_data(ttl=900, max_entries=8, show_spinner=False)
 def delineate_catchment_geometry_cached(target_lon: float, target_lat: float, initial_buffer: float, threshold: int):
@@ -726,13 +691,13 @@ with st.sidebar.expander("⚙️ 2 · Paramètres de délimitation", expanded=Tr
     "Fenêtre initiale (°)",
     min_value=0.30,
     max_value=1.20,
-    value=0.50,
+    value=0.40,
     step=0.05,
     help=(
         "Correspondance recommandée selon la surface du bassin :\n\n"
         "• **0.30°** : Petit / Micro-bassin (≤ 100 km²)\n"
         "• **0.50° - 0.60°** : Bassin moyen (100 à 5 000 km²)\n"
-        "• **0.80° - 1.20°** : Grand bassin (5 000 à 20 000 km² max)"
+        "• **0.70° - 1°** : Grand bassin (5 000 à 20 000 km² max)"
     )
 )
     accumulation_threshold = st.slider(
@@ -784,6 +749,20 @@ with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
             st.success(f"GDAL OK · {diag['width']:,}×{diag['height']:,} · échantillon {diag['sample_shape']} · {diag['elapsed_s']} s")
         except Exception as e:
             st.error(f"Test GDAL échoué : {type(e).__name__}: {e}")
+
+    # --- Bloc Diagnostic RAM (à coller à la ligne 752) ---
+        st.divider()
+        ram_used = psutil.Process().memory_info().rss / (1024 * 1024)
+        ram_limit = 2700.0  # Limite Streamlit Cloud (Mo)
+        pct_used = (ram_used / ram_limit) * 100
+
+        st.caption("📊 **Utilisation Mémoire RAM**")
+        st.metric(
+            label="RAM consommée", 
+            value=f"{ram_used:.1f} Mo", 
+            delta=f"{ram_limit - ram_used:.1f} Mo libres"
+        )
+        st.progress(min(pct_used / 100, 1.0))
 
 # --- Conteneurs principaux ---
 col_map, col_panel = st.columns([1.7, 1.5], gap="large")
@@ -1175,3 +1154,4 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
             st.rerun()
     except Exception as e:
         st.error(f"⚠️ Erreur lors de la lecture des ressources distantes : {type(e).__name__}: {e}")
+        

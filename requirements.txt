@@ -11,4 +11,5 @@ scikit-learn>=1.3.0
 huggingface-hub>=0.20.0
 affine>=2.4.0
 reportlab
+psutil
 fpdf2
