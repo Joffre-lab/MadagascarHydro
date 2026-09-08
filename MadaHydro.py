@@ -586,11 +586,11 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.3px; }
 }
 .mh-brand-row { display: flex; align-items: center; gap: 0.8rem; }
 .mh-logo { width: 44px; height: 44px; border-radius: 13px; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #0284c7, #06b6d4); box-shadow: 0 7px 18px rgba(2, 132, 199, 0.18); font-size: 1.4rem; }
-.mh-title { font-size: 1.65rem; line-height: 1.3 !important; font-weight: 800; color: var(--mh-text); padding-top: 4px !important; }
-.mh-subtitle { margin-top: 0.28rem; font-size: 0.78rem; color: var(--mh-muted); font-weight: 600; }
+.mh-title { font-size: 1.65rem; line-height: 1.3 !important; font-weight: 800; color: inherit !important; padding-top: 4px !important; }
+.mh-subtitle { margin-top: 0.28rem; font-size: 0.78rem; color: inherit !important; opacity: 0.75; font-weight: 600; }
+.mh-description { margin-top: 0.65rem; font-size: 0.79rem; line-height: 1.5; color: inherit !important; opacity: 0.85; max-width: 980px; }
 .mh-header-spacer { flex: 1; }
 .mh-pill { font-size: 0.63rem; letter-spacing: 0.9px; font-weight: 800; padding: 0.36rem 0.55rem; border-radius: 999px; color: #0369a1; background: rgba(14,165,233,0.11); border: 1px solid rgba(14,165,233,0.16); }
-.mh-description { margin-top: 0.65rem; font-size: 0.79rem; line-height: 1.5; color: #475569; max-width: 980px; }
 .mh-side-status { display: flex; align-items: center; gap: 0.65rem; padding: 0.7rem 0.75rem; border-radius: 12px; border: 1px solid var(--mh-border); margin: 0.4rem 0 0.8rem 0; }
 .mh-side-status .status-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
 .mh-side-status.pro { background: rgba(16,185,129,0.07); }
@@ -624,7 +624,7 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.3px; }
 """, unsafe_allow_html=True)
 
 # --- Barre latérale ---
-st.sidebar.markdown("## Navigation")
+st.sidebar.markdown("<div style='color: var(--primary-color, #3b82f6) !important; font-size: 26px; font-weight: 800; margin-bottom: 2px;'>Navigation</div>", unsafe_allow_html=True)
 st.sidebar.caption("Préparez l'exutoire, contrôlez la vue puis lancez l'analyse.")
 
 status_label = "PRO · Analyse complète" if st.session_state.is_pro else "GRATUIT · Délimitation"
@@ -824,7 +824,12 @@ with col_panel:
 
     if st.session_state.metrics is None:
         with st.container(border=True):
-            st.write("La plateforme calculera automatiquement la géométrie du bassin à partir du Modèle Numérique de Surface.")
+            st.markdown("**Plateforme d'ingénierie hydrologique de haute précision**")
+            st.caption("Délimitation instantanée, caractérisation topographique et modélisation de crues augmentée par IA.")
+            st.markdown("---")
+            st.markdown("**Contact & Assistance :**")
+            st.markdown("💬 [Contacter sur WhatsApp](https://api.whatsapp.com/send/?phone=327829333)")
+            st.markdown("✉️ [Envoyer un e-mail](https://mail.google.com/mail/?view=cm&fs=1&to=joffrerazafimihary@gmail.com&su=Demande%20d%27acces%20MadaHydro)")
     else:
         m_data = st.session_state.metrics
         with st.container(border=True):
