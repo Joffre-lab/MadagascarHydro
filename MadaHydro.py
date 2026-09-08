@@ -114,15 +114,13 @@ def get_q10_model():
 def get_madagascar_utm_epsg(longitude):
     return 32739 if longitude >= 48.0 else 32738
 
-def compute_passini_tc(area_km2, l_rect_km, slope_m_km):
-    """Calcul du temps de concentration de Passini (en heures).
-    Pente en m/m = slope_m_km / 1000.0.
-    """
-    safe_slope_m_m = max(float(slope_m_km) / 1000.0, 0.0001)
-    safe_length    = max(float(l_rect_km), 0.1)
-    safe_area      = max(float(area_km2), 0.01)
-    
-    tc_hours = 0.108 * ((safe_area * safe_length) ** (1.0 / 3.0)) / np.sqrt(safe_slope_m_m)
+def compute_giandotti_tc(area_km2, l_rect_km, z_moy_m, min_elev_m):
+    """Calcul du temps de concentration de Giandotti (en heures)."""
+    safe_area = max(float(area_km2), 0.01)
+    safe_length = max(float(l_rect_km), 0.1)
+    dz = max(float(z_moy_m - min_elev_m), 1.0)  # Évite la division par zéro
+
+    tc_hours = (4.0 * np.sqrt(safe_area) + 1.5 * safe_length) / (0.8 * np.sqrt(dz))
     return max(round(tc_hours, 2), 0.10)
 
 def detect_versant(lat, lon):
@@ -330,16 +328,18 @@ def compute_q10_ml(model, area_km2, p10_mm, slope_m_km, e_cal, g_cal, v_cal, p_d
     for T in [25, 50, 100]: q_dict[T] = Q10 * (p_design[T] / p10) ** 1.39
     return q_dict
 
-# --- Auto-expansion à portée élargie ---
+# --- Auto-expansion dynamique optimisée (Axes Nord/Sud corrigés) ---
 def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
     d8 = (64, 128, 1, 2, 4, 8, 16, 32)
-    max_iter = 6  # 👈 Passé de 3/4 à 6 pour englober les grands bassins
+    max_iter = 4
     edge = 8
 
     xmin, xmax = target_lon - initial_buffer, target_lon + initial_buffer
     ymin, ymax = target_lat - initial_buffer, target_lat + initial_buffer
 
     final_grid = final_fdir = final_acc = final_catchment = None
+
+    # Seuil fixe pour garder le même point d'exutoire (snapping stable)
     fixed_threshold = int(threshold)
 
     for i in range(1, max_iter + 1):
@@ -348,6 +348,7 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
         try:
             bbox = (xmin, ymin, xmax, ymax)
 
+            # Lecture distante
             grid = Grid.from_raster(FLOW_DIR_PATH, window=bbox)
             fdir = grid.read_raster(FLOW_DIR_PATH, window=bbox, d8_mapping=d8, dtype=np.uint8)
             acc  = grid.read_raster(FLOW_ACC_PATH, window=bbox, dtype=np.float32)
@@ -356,9 +357,11 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
             if not np.any(stream_mask):
                 raise ValueError(f"Aucun cours d'eau trouvé avec un seuil de {fixed_threshold:,}.")
 
+            # Snap + délimitation
             x_snap, y_snap = grid.snap_to_mask(stream_mask, (target_lon, target_lat))
             catchment = grid.catchment(x=x_snap, y=y_snap, fdir=fdir, d8_mapping=d8, xytype="coordinate")
 
+            # Détection du contact avec les bords
             h, w = catchment.shape
             my = min(edge, max(1, h // 10))
             mx = min(edge, max(1, w // 10))
@@ -370,6 +373,7 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
 
             touches = touch_north or touch_south or touch_west or touch_east
 
+            # Si le bassin est totalement englobé ou si c'est la dernière itération
             if not touches or i == max_iter:
                 final_grid = grid
                 final_fdir = fdir
@@ -378,13 +382,14 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 grid = fdir = acc = catchment = None
                 break
 
-            # 🚀 Pas d'expansion progressif pour capturer rapidement les grands contours
-            step = max(float(initial_buffer) * 1.8, 0.5 * i)
+            # Pas d'expansion
+            step = max(float(initial_buffer) * 1.2, 0.8)
 
-            if touch_north: ymax += step
-            if touch_south: ymin -= step
-            if touch_west:  xmin -= step
-            if touch_east:  xmax += step
+            # ✅ CORRECTION STRICTE DES AXES
+            if touch_north: ymax += step  # Nord = ligne 0 -> augmenter ymax
+            if touch_south: ymin -= step  # Sud = dernière ligne -> diminuer ymin
+            if touch_west:  xmin -= step  # Ouest = colonne 0 -> diminuer xmin
+            if touch_east:  xmax += step  # Est = dernière colonne -> augmenter xmax
 
         finally:
             if grid is not None: del grid
@@ -396,6 +401,7 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
     if final_grid is None or final_catchment is None:
         raise RuntimeError("Impossible de délimiter le bassin versant avec cette fenêtre.")
 
+    # Polygonisation
     mask_u8 = final_catchment.astype(np.uint8, copy=False)
     shapes = final_grid.polygonize(mask_u8)
 
@@ -678,8 +684,8 @@ with st.sidebar.expander("⚙️ 2 · Paramètres de délimitation", expanded=Tr
     accumulation_threshold = st.slider(
     "Seuil d'accumulation",
     min_value=100,
-    max_value=15000,
-    value=200,
+    max_value=10000,
+    value=500,
     step=100,
     help=(
         "Sensibilité d'extraction du cours d'eau :\n\n"
@@ -725,20 +731,20 @@ with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
         except Exception as e:
             st.error(f"Test GDAL échoué : {type(e).__name__}: {e}")
 
-    # --- Bloc Diagnostic RAM (à coller à la ligne 752) ---
-        st.divider()
-        ram_used = psutil.Process().memory_info().rss / (1024 * 1024)
-        ram_limit = 2700.0  # Limite Streamlit Cloud (Mo)
-        pct_used = (ram_used / ram_limit) * 100
+# --- Bloc Diagnostic RAM Indépendant 
+    st.sidebar.divider()
+    
+    ram_used = psutil.Process().memory_info().rss / (1024 * 1024)
+    ram_limit = 2700.0  # Limite Streamlit Cloud (Mo)
+    pct_used = (ram_used / ram_limit) * 100
 
-        st.caption("📊 **Utilisation Mémoire RAM**")
-        st.metric(
-            label="RAM consommée", 
-            value=f"{ram_used:.1f} Mo", 
-            delta=f"{ram_limit - ram_used:.1f} Mo libres"
-        )
-        st.progress(min(pct_used / 100, 1.0))
-
+    st.sidebar.caption("💻 **Utilisation Mémoire RAM**")
+    st.sidebar.metric(
+        label="RAM consommée",
+        value=f"{ram_used:.1f} Mo",
+        delta=f"{ram_limit - ram_used:.1f} Mo libres"
+    )
+    st.sidebar.progress(min(pct_used / 100, 1.0))
 
 # --- Conteneurs principaux ---
 col_map, col_panel = st.columns([1.7, 1.5], gap="large")
@@ -839,13 +845,14 @@ with col_panel:
             if st.session_state.get("hydro_computed", False):
                 with st.expander("🌍 Caractéristiques du bassin", expanded=False):
                     sc1, sc2, sc3 = st.columns(3)
-                    sc1.metric("Alt. min.", f"{m_data['min_elev']:.0f} m")
-                    sc2.metric("Alt. max.", f"{m_data['max_elev']:.0f} m")
+                    sc1.metric("Alt. min / max", f"{m_data['min_elev']:.0f} / {m_data['max_elev']:.0f} m")
+                    sc2.metric("Alt. moyenne", f"{m_data.get('z_moy', 0):.0f} m")
                     sc3.metric("Pente globale", f"{m_data['slope_m_km']:.1f} m/km")
 
-                    sc4, sc5 = st.columns(2)
-                    sc4.metric("Rectangle équiv.", f"{m_data['l_rect_km']:.1f} km")
-                    sc5.metric("Gravelius Kc", f"{m_data['kc']:.2f}")
+                    sc4, sc5, sc6 = st.columns(3)
+                    sc4.metric("Gravelius Kc", f"{m_data['kc']:.2f}")
+                    sc5.metric("Temps conc. (Giandotti)", f"{m_data.get('tc_giandotti_hours', 0):.1f} h")
+                    sc6.metric("Densité drainage", f"{m_data.get('dd', 0):.2f} km/km²")
 
                     st.markdown("**Occupation du sol**")
                     if not m_data.get("lc_df").empty:
@@ -1026,58 +1033,82 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
         with st.spinner("2/2 Lecture des Rasters distants & IA..."):
             m_data = st.session_state.metrics
 
-            # Lecture du DEM par fenêtre HTTP Range limitée
-            with rasterio.open(DEM_PATH) as dem_src:
-                dem_proj_gdf = st.session_state.catchment_gdf.to_crs(dem_src.crs)
-                dem_shapes = [geom for geom in dem_proj_gdf.geometry if geom is not None and not geom.is_empty]
-                dem_win = geometry_window(dem_src, dem_shapes, pad_x=0, pad_y=0)
-                dem_h = min(512, max(1, int(dem_win.height)))
-                dem_w = min(512, max(1, int(dem_win.width)))
-                
-                dem_arr = dem_src.read(
-                    1,
-                    window=dem_win,
-                    out_shape=(dem_h, dem_w),
-                    resampling=rasterio.enums.Resampling.average,
-                    masked=False,
-                ).astype(np.float32, copy=False)
-                dem_transform = window_transform(dem_win, dem_src.transform) * Affine.scale(
-                    dem_win.width / dem_w, dem_win.height / dem_h
-                )
-                dem_inside = geometry_mask(
-                    dem_shapes,
-                    out_shape=(dem_h, dem_w),
-                    transform=dem_transform,
-                    invert=True,
-                )
-                dem_nodata = dem_src.nodata
-                valid_mask = dem_inside & np.isfinite(dem_arr)
-                if dem_nodata is not None:
-                    valid_mask &= dem_arr != dem_nodata
-                valid_elevs = dem_arr[valid_mask]
-                valid_elevs = valid_elevs[valid_elevs > -50]
+           # Lecture du DEM par fenêtre HTTP Range limitée
+        with rasterio.open(DEM_PATH) as dem_src:
+            dem_proj_gdf = st.session_state.catchment_gdf.to_crs(dem_src.crs)
+            dem_shapes = [geom for geom in dem_proj_gdf.geometry if geom is not None and not geom.is_empty]
+            dem_win = geometry_window(dem_src, dem_shapes, pad_x=0, pad_y=0)
+            dem_h = min(512, max(1, int(dem_win.height)))
+            dem_w = min(512, max(1, int(dem_win.width)))
+
+            # 1. Peak réel à résolution native 
+            full_arr = dem_src.read(1, window=dem_win)
+            full_inside = geometry_mask(
+                dem_shapes,
+                out_shape=full_arr.shape,
+                transform=window_transform(dem_win, dem_src.transform),
+                invert=True
+            )
+            full_valid = full_arr[full_inside & np.isfinite(full_arr) & (full_arr != dem_src.nodata)]
+            exact_max_elev = float(np.max(full_valid)) if full_valid.size > 0 else 0.0
+            del full_arr, full_inside, full_valid
+
+            # 2. Grille 512x512 sous-échantillonnée pour la pente et les centiles
+            dem_arr = dem_src.read(
+                1,
+                window=dem_win,
+                out_shape=(dem_h, dem_w),
+                resampling=rasterio.enums.Resampling.bilinear,
+                masked=False
+            ).astype(np.float32, copy=False)
+
+            dem_transform = window_transform(dem_win, dem_src.transform) * Affine.scale(
+                dem_win.width / dem_w, dem_win.height / dem_h
+            )
+            dem_inside = geometry_mask(
+                dem_shapes,
+                out_shape=(dem_h, dem_w),
+                transform=dem_transform,
+                invert=True
+            )
+
+            dem_nodata = dem_src.nodata
+            valid_mask = dem_inside & np.isfinite(dem_arr)
+            if dem_nodata is not None:
+                valid_mask &= dem_arr != dem_nodata
+            valid_elevs = dem_arr[valid_mask]
+            valid_elevs = valid_elevs[valid_elevs > -50]
 
             if valid_elevs.size > 0:
                 pos_elevs = valid_elevs[valid_elevs > 0]
                 min_elev = float(np.min(pos_elevs)) if pos_elevs.size else 0.0
-                max_elev = float(np.max(valid_elevs))
-                z5_m = float(np.percentile(valid_elevs, 95))
-                z95_m = float(np.percentile(valid_elevs, 5))
-                slope_m_km = max((z5_m - z95_m) / max(m_data["l_rect_km"], 0.1), 0.5)
+                max_elev = exact_max_elev
+                z_moy = float(np.mean(valid_elevs)) 
+                z95_m = float(np.percentile(valid_elevs, 95))
+                z5_m = float(np.percentile(valid_elevs, 5))
+                slope_m_km = max((z95_m - z5_m) / max(m_data["l_rect_km"], 0.1), 0.5)
             else:
-                min_elev = max_elev = z5_m = z95_m = 0.0
+                min_elev = max_elev = z_moy = z5_m = z95_m = 0.0
                 slope_m_km = 0.5
 
+            # Calcul instantané de la densité de drainage Dd (km/km²)
+            stream_length_km = st.session_state.stream_gdf.geometry.length.sum() / 1000.0 if st.session_state.stream_gdf is not None else m_data["l_rect_km"]
+            dd = stream_length_km / max(m_data["area_km2"], 0.1)
+
+            # Temps de concentration Giandotti
+            tc_giandotti = compute_giandotti_tc(m_data["area_km2"], m_data["l_rect_km"], z_moy, min_elev)
+
             m_data.update({
-                "min_elev": min_elev, "max_elev": max_elev,
+                "min_elev": min_elev, 
+                "max_elev": max_elev,
+                "z_moy": round(z_moy, 1),
                 "slope_m_km": round(slope_m_km, 2),
                 "slope_m_m": slope_m_km / 1000.0,
-                "z5_m": round(z5_m, 1), "z95_m": round(z95_m, 1),
+                "z5_m": round(z5_m, 1), 
+                "z95_m": round(z95_m, 1),
+                "tc_giandotti_hours": tc_giandotti,
+                "dd": round(dd, 2)
             })
-
-            # Correction Passini Tc
-            tc_passini = compute_passini_tc(m_data["area_km2"], m_data["l_rect_km"], slope_m_km)
-            m_data["tc_passini_hours"] = tc_passini
 
             # Libération explicite de tous les tableaux DEM temporaires.
             try:
