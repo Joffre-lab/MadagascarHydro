@@ -1,3 +1,23 @@
-﻿# Ignorer les modèles ML locaux (téléchargés depuis Hugging Face en prod)
+﻿
+.streamlit/secrets.toml
+.env
+
+
+*.tif
+*.tiff
+
+
 Q10_Model_Prediction/
 *.joblib
+
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+
+.venv/
+venv/
+.vscode/
+.DS_Store

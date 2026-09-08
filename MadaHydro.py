@@ -1,7 +1,12 @@
 import os
 import streamlit as st
 
-# --- 1. Configuration GDAL pour streaming HTTP Range / COG ---
+HF_TOKEN = st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN", None))
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    os.environ["GDAL_HTTP_AUTH"] = "BEARER"
+    os.environ["GDAL_HTTP_BEARER"] = HF_TOKEN
+
 os.environ.setdefault("GDAL_HTTP_USERAGENT", "MadaHydro/1.0")
 os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "NO")
 os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
@@ -10,11 +15,9 @@ os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "2")
 os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
 os.environ.setdefault("GDAL_HTTP_TIMEOUT", "20")
 
-# Une seule plage HTTP à la fois : plus robuste avec les endpoints CDN/Xet de HF.
 os.environ.setdefault("GDAL_HTTP_MULTIRANGE", "NO")
 os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
 
-# Cache VSI limité pour éviter une explosion de RAM sur Streamlit Cloud.
 os.environ.setdefault("VSI_CACHE", "TRUE")
 os.environ.setdefault("VSI_CACHE_SIZE", "16777216")
 os.environ.setdefault("GDAL_CACHEMAX", "32")
@@ -47,7 +50,6 @@ import joblib
 from huggingface_hub import hf_hub_download
 from hydrology_pdf import create_pdf_report
 
-# --- 2. Ressources distantes Hugging Face ---
 HF_REPO_ID = "Reynolds002/MadaHydro-data"
 HF_REPO_TYPE = "dataset"
 HF_BASE_URL = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main"
@@ -67,15 +69,13 @@ WORLD_COVER_PATHS    = [
 ]
 
 MODEL_HF_FILENAME = "Q10_Model_Prediction/Q10_global_logq10.joblib"
-VALID_PRO_KEYS = ["HYDRO-PRO-2026", "MADA-HYDRO-PRO", "EXUTOIRE-2026"]
+VALID_PRO_KEYS = list(st.secrets.get("PRO_KEYS", []))
 
-# Limite fonctionnelle pour protéger Streamlit Cloud sans modifier
-# la résolution des rasters ni la logique hydrologique.
 MAX_CATCHMENT_AREA_KM2 = 20_000.0
 MAX_DELINEATION_ITERATIONS = 3
 
 
-# --- Modèle ML & Classes ---
+# Modèle ML & Classes ---
 class Q10FeatureEngineer:
     def __init__(self):
         self.feature_names_out_ = [
@@ -98,6 +98,7 @@ def load_q10_model():
             repo_id=HF_REPO_ID,
             filename=MODEL_HF_FILENAME,
             repo_type=HF_REPO_TYPE,
+            token=HF_TOKEN
         )
         model_data = joblib.load(local_model)
         if isinstance(model_data, dict) and "model" in model_data:
@@ -136,7 +137,7 @@ def detect_versant(lat, lon):
         else:
             return "Hautes_Terres"
 
-# --- Fonctions raster & calculs mis en CACHE ---
+#Fonctions raster 
 @st.cache_data(ttl=1800, max_entries=64, show_spinner=False)
 def get_local_raster_mean_cached(gdf_json: str, raster_path: str, fallback_value: float, max_dim: int = 512):
     """Lit une statistique raster locale avec sortie scalaire uniquement.
@@ -328,7 +329,7 @@ def compute_q10_ml(model, area_km2, p10_mm, slope_m_km, e_cal, g_cal, v_cal, p_d
     for T in [25, 50, 100]: q_dict[T] = Q10 * (p_design[T] / p10) ** 1.39
     return q_dict
 
-# --- Auto-expansion dynamique optimisée (Axes Nord/Sud corrigés) ---
+# Auto-expansion dynamique 
 def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
     d8 = (64, 128, 1, 2, 4, 8, 16, 32)
     max_iter = 4
@@ -339,7 +340,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
 
     final_grid = final_fdir = final_acc = final_catchment = None
 
-    # Seuil fixe pour garder le même point d'exutoire (snapping stable)
     fixed_threshold = int(threshold)
 
     for i in range(1, max_iter + 1):
@@ -348,7 +348,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
         try:
             bbox = (xmin, ymin, xmax, ymax)
 
-            # Lecture distante
             grid = Grid.from_raster(FLOW_DIR_PATH, window=bbox)
             fdir = grid.read_raster(FLOW_DIR_PATH, window=bbox, d8_mapping=d8, dtype=np.uint8)
             acc  = grid.read_raster(FLOW_ACC_PATH, window=bbox, dtype=np.float32)
@@ -357,11 +356,9 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
             if not np.any(stream_mask):
                 raise ValueError(f"Aucun cours d'eau trouvé avec un seuil de {fixed_threshold:,}.")
 
-            # Snap + délimitation
             x_snap, y_snap = grid.snap_to_mask(stream_mask, (target_lon, target_lat))
             catchment = grid.catchment(x=x_snap, y=y_snap, fdir=fdir, d8_mapping=d8, xytype="coordinate")
 
-            # Détection du contact avec les bords
             h, w = catchment.shape
             my = min(edge, max(1, h // 10))
             mx = min(edge, max(1, w // 10))
@@ -385,7 +382,6 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
             # Pas d'expansion
             step = max(float(initial_buffer) * 1.2, 0.8)
 
-            # ✅ CORRECTION STRICTE DES AXES
             if touch_north: ymax += step  # Nord = ligne 0 -> augmenter ymax
             if touch_south: ymin -= step  # Sud = dernière ligne -> diminuer ymin
             if touch_west:  xmin -= step  # Ouest = colonne 0 -> diminuer xmin
@@ -472,7 +468,7 @@ def test_remote_raster(raster_path: str):
     info["elapsed_s"] = round(time.perf_counter() - t0, 2)
     return info
 
-# --- 3. Configuration & State ---
+#Configuration
 st.set_page_config(layout="wide", page_title="MadaHydro", page_icon="🇲🇬", initial_sidebar_state="expanded")
 APP_VERSION = "HF-COG-STREAM-v3-RAM25K"
 
@@ -554,7 +550,7 @@ for _key, _default in [
 if st.query_params.get("key", "") in VALID_PRO_KEYS:
     st.session_state.is_pro = True
 
-# --- 4. Interface Utilisateur & CSS ---
+#Interface Utilisateur & CSS ---
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
@@ -613,17 +609,13 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.3px; }
         <div class="mh-logo">MG</div>
         <div>
             <div class="mh-title">Madagascar Watershed Explorer</div>
-            <div class="mh-subtitle">Hydrologie appliquée · Madagascar</div>
+            <div class="mh-subtitle">AI-Driven Hydrological Modeling & Watershed Analytics Engine</div>
         </div>
         <div class="mh-header-spacer"></div>
     </div>
-    <div class="mh-description">
-        Délimitez un bassin versant à partir d'un exutoire, puis explorez ses indicateurs hydrologiques et ses estimations de crue dans un environnement de travail orienté ingénierie.
-    </div>
 </div>
 """, unsafe_allow_html=True)
-
-# --- Barre latérale ---
+ 
 st.sidebar.markdown("<div style='color: var(--primary-color, #3b82f6) !important; font-size: 26px; font-weight: 800; margin-bottom: 2px;'>Navigation</div>", unsafe_allow_html=True)
 st.sidebar.caption("Préparez l'exutoire, contrôlez la vue puis lancez l'analyse.")
 
@@ -731,11 +723,11 @@ with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
         except Exception as e:
             st.error(f"Test GDAL échoué : {type(e).__name__}: {e}")
 
-# --- Bloc Diagnostic RAM Indépendant 
+
     st.sidebar.divider()
     
     ram_used = psutil.Process().memory_info().rss / (1024 * 1024)
-    ram_limit = 2700.0  # Limite Streamlit Cloud (Mo)
+    ram_limit = 2700.0  
     pct_used = (ram_used / ram_limit) * 100
 
     st.sidebar.caption("💻 **Utilisation Mémoire RAM**")
@@ -746,11 +738,10 @@ with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
     )
     st.sidebar.progress(min(pct_used / 100, 1.0))
 
-# --- Conteneurs principaux ---
+#Conteneurs principaux 
 col_map, col_panel = st.columns([1.7, 1.5], gap="large")
 
 with col_map:
-    st.markdown('<div class="mh-section-title"><span>🗺️</span><div><strong>Carte d’exploration</strong><small>Délimitation interactive du bassin versant</small></div></div>', unsafe_allow_html=True)
     m = leafmap.Map(center=st.session_state.map_center, zoom=st.session_state.map_zoom)
     try: m.add_basemap(map_basemap)
     except Exception: m.add_basemap("HYBRID")
@@ -758,12 +749,12 @@ with col_map:
     if show_catchment and st.session_state.catchment_gdf is not None:
         m.add_gdf(st.session_state.catchment_gdf, layer_name="Bassin versant", style={"color": "#ef4444", "weight": 3, "fillColor": "#ef4444", "fillOpacity": 0.20})
     
-    # Calcul à la demande du réseau hydrographique si l'utilisateur coche la case
+    
     if show_network and st.session_state.catchment_gdf is not None and st.session_state.last_coords is not None:
         if st.session_state.stream_gdf is not None and not st.session_state.stream_gdf.empty:
             m.add_gdf(st.session_state.stream_gdf, layer_name="Réseau hydrographique", style={"color": "#06b6d4", "weight": 2})
         elif not st.session_state.network_attempted:
-            # Une seule extraction par bassin : un pan/zoom ne relance jamais le calcul.
+            
             with st.spinner("Extraction à la demande du réseau hydrographique..."):
                 lon_e, lat_e = st.session_state.last_coords[1], st.session_state.last_coords[0]
                 eff_acc = max(accumulation_threshold, int(buffer_deg * 25000))
@@ -780,10 +771,6 @@ with col_map:
         m.fit_bounds(st.session_state.map_bounds)
         st.session_state.map_bounds = None 
 
-    # IMPORTANT : seuls les clics doivent remonter à Streamlit.
-    # En limitant returned_objects à "last_clicked", les événements Leaflet
-    # de pan/zoom (center, zoom, bounds) ne modifient pas la valeur du composant
-    # et ne provoquent donc pas de rerun Streamlit.
     map_data = st_folium(
     m,
     height=map_height,
@@ -794,20 +781,14 @@ with col_map:
 )
     st.caption("💡 Cliquez sur un exutoire pour lancer la délimitation. Le pan et le zoom n’interrompent pas le calcul.")
 
-# Seul un nouveau clic sur la carte crée une demande de délimitation.
-# Le pan/zoom n'est volontairement pas lu ici : il ne provoque aucun rerun
-# avec returned_objects=["last_clicked"].
 
-# Seul un nouveau clic sur la carte crée une demande de délimitation.
-# Le pan/zoom n'est volontairement pas lu ici : il ne provoque aucun rerun
-# avec returned_objects=["last_clicked"].
 if map_data and map_data.get("last_clicked"):
     lat = float(map_data["last_clicked"]["lat"])
     lon = float(map_data["last_clicked"]["lng"])
     click_key = (round(lat, 7), round(lon, 7))
 
     if input_mode == "Clic sur la carte":
-        # Déclenchement uniquement s'il s'agit d'un VÉRITABLE nouveau clic
+        
         if st.session_state.get("last_click_key") != click_key:
             st.session_state.last_click_key = click_key
             st.session_state.last_coords = (lat, lon)
@@ -816,7 +797,7 @@ if map_data and map_data.get("last_clicked"):
             st.session_state.network_attempted = False
             st.session_state.network_error = None
     else:
-        # En mode Saisie manuelle : mémoriser la clé du clic sans activer analysis_requested
+        
         st.session_state.last_click_key = click_key
 
 with col_panel:
@@ -824,8 +805,8 @@ with col_panel:
 
     if st.session_state.metrics is None:
         with st.container(border=True):
-            st.markdown("**Plateforme d'ingénierie hydrologique de haute précision**")
-            st.caption("Délimitation instantanée, caractérisation topographique et modélisation de crues augmentée par IA.")
+            st.markdown("**Du MNT aux débits de projet · Hydrodynamique physique & prédictive**")
+            st.caption("Délimitez un bassin versant à partir d'un exutoire, puis explorez ses indicateurs hydrologiques et ses estimations de crue dans un environnement de travail orienté ingénierie.")
             st.markdown("---")
             st.markdown("**Contact & Assistance :**")
             st.markdown("💬 [Contacter sur WhatsApp](https://api.whatsapp.com/send/?phone=327829333)")
@@ -954,7 +935,7 @@ with st.expander("📖 Guide d'utilisation", expanded=False):
     """)
 st.markdown('</div>', unsafe_allow_html=True)
 
-# --- 5. Pipelines d'Exécution Optimisés ---
+
 do_phase_1 = bool(st.session_state.get("analysis_requested", False) and st.session_state.get("pending_coords"))
 if do_phase_1:
     try:
@@ -995,13 +976,13 @@ if do_phase_1:
                 dx, dy = maxx - minx, maxy - miny
                 st.session_state.map_bounds = [[miny - dy * 0.25, minx - dx * 0.25], [maxy + dy * 0.25, maxx + dx * 0.25]]
 
-                # Le mode FREE ne lit aucun DEM : valeurs par défaut légères
+                
                 min_elev = max_elev = z5_m = z95_m = 0.0
                 slope_m_km = 0.5
                 slope_m_m = slope_m_km / 1000.0
 
             st.session_state.catchment_gdf = gdf
-            st.session_state.stream_gdf = None  # Calculé uniquement à la demande si demandé
+            st.session_state.stream_gdf = None 
             st.session_state.metrics = {
                 "area_km2": area_km2, "perimeter_km": perimeter_km,
                 "min_elev": min_elev, "max_elev": max_elev,
@@ -1038,7 +1019,7 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
         with st.spinner("2/2 Lecture des Rasters distants & IA..."):
             m_data = st.session_state.metrics
 
-           # Lecture du DEM par fenêtre HTTP Range limitée
+           
         with rasterio.open(DEM_PATH) as dem_src:
             dem_proj_gdf = st.session_state.catchment_gdf.to_crs(dem_src.crs)
             dem_shapes = [geom for geom in dem_proj_gdf.geometry if geom is not None and not geom.is_empty]
@@ -1046,7 +1027,7 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
             dem_h = min(512, max(1, int(dem_win.height)))
             dem_w = min(512, max(1, int(dem_win.width)))
 
-            # 1. Peak réel à résolution native 
+            
             full_arr = dem_src.read(1, window=dem_win)
             full_inside = geometry_mask(
                 dem_shapes,
@@ -1058,7 +1039,7 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
             exact_max_elev = float(np.max(full_valid)) if full_valid.size > 0 else 0.0
             del full_arr, full_inside, full_valid
 
-            # 2. Grille 512x512 sous-échantillonnée pour la pente et les centiles
+            
             dem_arr = dem_src.read(
                 1,
                 window=dem_win,
@@ -1096,7 +1077,7 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
                 min_elev = max_elev = z_moy = z5_m = z95_m = 0.0
                 slope_m_km = 0.5
 
-            # Calcul instantané de la densité de drainage Dd (km/km²)
+            
             stream_length_km = st.session_state.stream_gdf.geometry.length.sum() / 1000.0 if st.session_state.stream_gdf is not None else m_data["l_rect_km"]
             dd = stream_length_km / max(m_data["area_km2"], 0.1)
 
@@ -1115,7 +1096,7 @@ if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and n
                 "dd": round(dd, 2)
             })
 
-            # Libération explicite de tous les tableaux DEM temporaires.
+            
             try:
                 del dem_arr
             except NameError:
