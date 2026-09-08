@@ -67,7 +67,7 @@ WORLD_COVER_PATHS    = [
 ]
 
 MODEL_HF_FILENAME = "Q10_Model_Prediction/Q10_global_logq10.joblib"
-VALID_PRO_KEYS = ["HYDRO-PRO-2026", "MADA-HYDRO-PRO", "EXUTOIRE-PRO-2026"]
+VALID_PRO_KEYS = ["HYDRO-PRO-2026", "MADA-HYDRO-PRO", "EXUTOIRE-2026"]
 
 # Limite fonctionnelle pour protéger Streamlit Cloud sans modifier
 # la résolution des rasters ni la logique hydrologique.
@@ -330,84 +330,47 @@ def compute_q10_ml(model, area_km2, p10_mm, slope_m_km, e_cal, g_cal, v_cal, p_d
     for T in [25, 50, 100]: q_dict[T] = Q10 * (p_design[T] / p10) ** 1.39
     return q_dict
 
-# --- Auto-expansion dynamique optimisée ---
+# --- Auto-expansion à portée élargie ---
 def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
     d8 = (64, 128, 1, 2, 4, 8, 16, 32)
-    max_iter = 3
+    max_iter = 6  # 👈 Passé de 3/4 à 6 pour englober les grands bassins
     edge = 8
 
     xmin, xmax = target_lon - initial_buffer, target_lon + initial_buffer
     ymin, ymax = target_lat - initial_buffer, target_lat + initial_buffer
 
     final_grid = final_fdir = final_acc = final_catchment = None
+    fixed_threshold = int(threshold)
 
     for i in range(1, max_iter + 1):
         grid = fdir = acc = catchment = None
 
         try:
-            # Seuil adapté à la taille actuelle de la fenêtre
-            current_buffer = max(
-                target_lon - xmin, xmax - target_lon,
-                target_lat - ymin, ymax - target_lat
-            )
-            effective_threshold = max(
-                int(threshold),
-                int(current_buffer * 25000)
-            )
-
             bbox = (xmin, ymin, xmax, ymax)
 
-            # Lecture distante minimale
             grid = Grid.from_raster(FLOW_DIR_PATH, window=bbox)
+            fdir = grid.read_raster(FLOW_DIR_PATH, window=bbox, d8_mapping=d8, dtype=np.uint8)
+            acc  = grid.read_raster(FLOW_ACC_PATH, window=bbox, dtype=np.float32)
 
-            fdir = grid.read_raster(
-                FLOW_DIR_PATH,
-                window=bbox,
-                d8_mapping=d8,
-                dtype=np.uint8
-            )
-
-            acc = grid.read_raster(
-                FLOW_ACC_PATH,
-                window=bbox,
-                dtype=np.float32
-            )
-
-            stream_mask = acc > effective_threshold
+            stream_mask = acc > fixed_threshold
             if not np.any(stream_mask):
-                raise ValueError(
-                    f"Aucun cours d'eau trouvé avec un seuil de "
-                    f"{effective_threshold:,}. Diminuez le seuil."
-                )
+                raise ValueError(f"Aucun cours d'eau trouvé avec un seuil de {fixed_threshold:,}.")
 
-            # Snap + délimitation
-            x_snap, y_snap = grid.snap_to_mask(
-                stream_mask,
-                (target_lon, target_lat)
-            )
+            x_snap, y_snap = grid.snap_to_mask(stream_mask, (target_lon, target_lat))
+            catchment = grid.catchment(x=x_snap, y=y_snap, fdir=fdir, d8_mapping=d8, xytype="coordinate")
 
-            catchment = grid.catchment(
-                x=x_snap,
-                y=y_snap,
-                fdir=fdir,
-                d8_mapping=d8,
-                xytype="coordinate"
-            )
-
-            # Détection robuste du contact avec les bords
             h, w = catchment.shape
             my = min(edge, max(1, h // 10))
             mx = min(edge, max(1, w // 10))
 
-            touches = (
-                np.any(catchment[:my, :]) or
-                np.any(catchment[-my:, :]) or
-                np.any(catchment[:, :mx]) or
-                np.any(catchment[:, -mx:])
-            )
+            touch_north = bool(np.any(catchment[:my, :]))
+            touch_south = bool(np.any(catchment[-my:, :]))
+            touch_west  = bool(np.any(catchment[:, :mx]))
+            touch_east  = bool(np.any(catchment[:, -mx:]))
 
-            # Bassin complètement contenu
-            if not touches:
+            touches = touch_north or touch_south or touch_west or touch_east
+
+            if not touches or i == max_iter:
                 final_grid = grid
                 final_fdir = fdir
                 final_acc = acc
@@ -415,45 +378,24 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
                 grid = fdir = acc = catchment = None
                 break
 
-            # Dernière tentative : conserver le résultat
-            if i == max_iter:
-                final_grid = grid
-                final_fdir = fdir
-                final_acc = acc
-                final_catchment = catchment
-                grid = fdir = acc = catchment = None
-                break
+            # 🚀 Pas d'expansion progressif pour capturer rapidement les grands contours
+            step = max(float(initial_buffer) * 1.8, 0.5 * i)
 
-            # Expansion progressive, uniquement dans les directions nécessaires
-            step = max(float(initial_buffer) * 1.2, 1)
-
-            if np.any(catchment[:, :mx]):
-                xmin -= step
-            if np.any(catchment[:, -mx:]):
-                xmax += step
-            if np.any(catchment[:my, :]):
-                ymin -= step
-            if np.any(catchment[-my:, :]):
-                ymax += step
+            if touch_north: ymax += step
+            if touch_south: ymin -= step
+            if touch_west:  xmin -= step
+            if touch_east:  xmax += step
 
         finally:
-            if grid is not None:
-                del grid
-            if fdir is not None:
-                del fdir
-            if acc is not None:
-                del acc
-            if catchment is not None:
-                del catchment
+            if grid is not None: del grid
+            if fdir is not None: del fdir
+            if acc is not None: del acc
+            if catchment is not None: del catchment
             gc.collect()
 
     if final_grid is None or final_catchment is None:
-        raise RuntimeError(
-            "Impossible de délimiter le bassin versant "
-            "avec la fenêtre de recherche actuelle."
-        )
+        raise RuntimeError("Impossible de délimiter le bassin versant avec cette fenêtre.")
 
-    # Polygonisation
     mask_u8 = final_catchment.astype(np.uint8, copy=False)
     shapes = final_grid.polygonize(mask_u8)
 
