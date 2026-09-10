@@ -72,7 +72,7 @@ MODEL_HF_FILENAME = "Q10_Model_Prediction/Q10_global_logq10.joblib"
 VALID_PRO_KEYS = list(st.secrets.get("PRO_KEYS", []))
 
 MAX_CATCHMENT_AREA_KM2 = 20_000.0
-MAX_DELINEATION_ITERATIONS = 3
+MAX_DELINEATION_ITERATIONS = 4
 
 
 # Modèle ML & Classes ---
@@ -627,14 +627,55 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
+buffer_deg = 0.40 
+
 with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
     input_mode = st.radio(
-    "Méthode de sélection",
-    ["Saisie manuelle", "Clic sur la carte"],
-    index=0,
-    horizontal=False,
-    label_visibility="collapsed"
-)
+        "Méthode de sélection",
+        ["Saisie manuelle", "Clic sur la carte"],
+        index=0,
+        horizontal=False,
+        label_visibility="collapsed"
+    )
+    
+    st.markdown("---")
+    st.markdown(
+        "<div style='background-color: rgba(59, 130, 246, 0.08); padding: 10px; border-radius: 8px; border-left: 4px solid #3b82f6; margin-bottom: 12px;'>"
+        "<span style='font-weight: 600; color: #1e40af;'>Type & gabarit du cours d'eau</span>"
+        "</div>", 
+        unsafe_allow_html=True
+    )
+
+    target_scale = st.selectbox(
+        "Veuillez choisir la nature du cours d'eau à délimiter",
+        options=[
+            "Ruisseau / Ravine (< 100 km²)",
+            "Rivière secondaire (100 – 1 000 km²)",
+            "Grand cours d'eau (1 000 – 5 000 km²)",
+            "Fleuve principal (> 5 000 km²)"
+        ],
+        index=2
+    )
+
+    THRESHOLD_PRESETS = {
+        "Ruisseau / Ravine (< 100 km²)": 1_000,
+        "Rivière secondaire (100 – 1 000 km²)": 10_000,
+        "Grand cours d'eau (1 000 – 5 000 km²)": 80_000,
+        "Fleuve principal (> 5 000 km²)": 400_000
+    }
+    rec_val = THRESHOLD_PRESETS[target_scale]
+
+    accumulation_threshold = st.slider(
+        "Seuil d'accumulation (pixels 30m)",
+        min_value=100,
+        max_value=700_000,
+        value=rec_val,
+        step=2_000,
+        help="Un seuil élevé élimine les affluents secondaires et force le calage sur le lit majeur du fleuve."
+    )
+
+    st.markdown("---")
+    
     target_lat, target_lon = None, None
     do_phase_1 = False
 
@@ -642,7 +683,7 @@ with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
         st.caption("Coordonnées en degrés décimaux, degrés/minutes ou DMS.")
         lat_input = st.text_input("Latitude", value="-18.8792", key="lat_input")
         lon_input = st.text_input("Longitude", value="47.5079", key="lon_input")
-        if st.button("🚀 Délimiter le bassin", type="primary", width="stretch"):
+        if st.button("Délimiter le bassin versant", type="primary", use_container_width=True):
             try:
                 target_lat = parse_coordinate(lat_input, is_latitude=True)
                 target_lon = parse_coordinate(lon_input, is_latitude=False)
@@ -653,47 +694,18 @@ with st.sidebar.expander("📌 1 · Exutoire", expanded=True):
             except Exception:
                 st.error("Coordonnées invalides.")
     else:
-        st.info("Cliquez directement sur l'exutoire souhaité dans la carte.")
+        st.info("**Mode Clic actif** : Indiquez le **type de cours d'eau** ci-dessus, puis cliquez directement sur son lit dans la carte.")
         if st.session_state.last_coords is not None:
             lat0, lon0 = st.session_state.last_coords
             st.caption(f"Dernier exutoire : **{lat0:.5f}, {lon0:.5f}**")
 
-with st.sidebar.expander("⚙️ 2 · Paramètres de délimitation", expanded=True):
-    st.caption("Ces paramètres contrôlent la fenêtre de recherche et le réseau extrait.")
-    buffer_deg = st.slider(
-    "Fenêtre initiale (°)",
-    min_value=0.30,
-    max_value=1.20,
-    value=0.40,
-    step=0.05,
-    help=(
-        "Correspondance recommandée selon la surface du bassin :\n\n"
-        "• **0.30°** : Petit / Micro-bassin (≤ 100 km²)\n"
-        "• **0.50° - 0.60°** : Bassin moyen (100 à 5 000 km²)\n"
-        "• **0.70° - 1°** : Grand bassin (5 000 à 20 000 km² max)"
-    )
-)
-    accumulation_threshold = st.slider(
-    "Seuil d'accumulation",
-    min_value=100,
-    max_value=10000,
-    value=500,
-    step=100,
-    help=(
-        "Sensibilité d'extraction du cours d'eau :\n\n"
-        "• **100 - 500** : Ravines et ruisseaux (S ≤ 100 km²)\n"
-        "• **1 000 - 5 000** : Rivières secondaires (100 à 5 000 km²)\n"
-        "• **10 000+** : Fleuves principaux (S > 10 000 km²)"
-    )
-)
-
-with st.sidebar.expander("🗺️ 3 · Affichage de la carte", expanded=False):
+with st.sidebar.expander("🗺️ 2 · Affichage de la carte", expanded=False):
     map_basemap = st.selectbox("Fond cartographique", ["HYBRID", "SATELLITE", "ROADMAP", "TERRAIN"], index=0)
     show_catchment = st.checkbox("Afficher le bassin", value=True)
     show_network = st.checkbox("Afficher le réseau hydrographique", value=False, help="Calculé à la demande pour préserver les ressources.")
     map_height = st.select_slider("Hauteur de la carte", options=[620, 680, 740, 800], value=740)
 
-with st.sidebar.expander("📌 4 · Contrôles rapides", expanded=False):
+with st.sidebar.expander("⚡ 3 · Contrôles rapides", expanded=False):
     if st.session_state.last_coords is not None:
         lat0, lon0 = st.session_state.last_coords
         st.metric("Exutoire", f"{lat0:.4f}° / {lon0:.4f}°")
@@ -926,17 +938,17 @@ with st.expander("📖 Guide d'utilisation", expanded=False):
     st.markdown("""
     ### Utilisation en 4 étapes
 
-    **1 · Choisir l'exutoire**  
-    Cliquez sur la carte ou saisissez les coordonnées dans la barre latérale. Les formats décimaux, degrés/minutes et DMS sont pris en charge.
+    **1 · Choisir le gabarit du cours d'eau**
+    Sélectionnez la nature de la rivière (du ruisseau au fleuve principal). Le seuil de calage s'ajuste automatiquement pour éviter les erreurs d'accrochage sur les affluents secondaires.
 
-    **2 · Régler la délimitation**  
-    Ajustez la fenêtre de recherche et le seuil d'accumulation uniquement lorsque nécessaire.
+    **2 · Positionner l'exutoire**
+    Cliquez directement sur le lit du cours d'eau sur la carte ou saisissez ses coordonnées. La fenêtre de calcul s'agrandit automatiquement selon la taille du bassin.
 
-    **3 · Examiner les résultats**  
-    La version gratuite présente la géométrie du bassin. Le mode PRO ouvre le profilage morphologique, l'occupation du sol, la pluviométrie et les estimations de crue par IA.
+    **3 · Examiner les résultats**
+    Visualisez la géométrie, la surface et le périmètre du bassin versant. Le mode PRO débloque l'analyse morphologique, l'occupation du sol, la pluviométrie et l'estimation des crues par IA.
 
-    **4 · Exporter**  
-    Téléchargez les couches SIG et, en mode PRO, le rapport d'étude complet au format PDF.
+    **4 · Exporter**
+    Téléchargez les couches spatiales au format Shapefile (.ZIP) et générez un rapport d'étude complet en PDF (Mode PRO).
     """)
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -959,9 +971,20 @@ if do_phase_1:
             if features:
                 gdf_raw = gpd.GeoDataFrame.from_features(features).set_crs("EPSG:4326")
                 gdf_proj = gdf_raw.to_crs(epsg=target_epsg)
-                gdf_proj["geometry"] = gdf_proj.geometry.simplify(tolerance=60.0, preserve_topology=True)
-
+    
                 area_km2 = float(gdf_proj.geometry.area.sum() / 1e6)
+
+                if area_km2 < 500:
+                    tolerance = 30.0
+                elif area_km2 <= 1000:
+                    tolerance = 50.0
+                else:
+                    tolerance = 60.0
+
+                gdf_proj["geometry"] = gdf_proj.geometry.simplify(
+                    tolerance=tolerance, 
+                    preserve_topology=True
+                )
 
                 if area_km2 > MAX_CATCHMENT_AREA_KM2:
                     raise ValueError(
