@@ -414,7 +414,7 @@ def get_dynamic_catchment(target_lon, target_lat, initial_buffer, threshold):
 
 @st.cache_data(ttl=900, max_entries=8, show_spinner=False)
 def delineate_catchment_geometry_cached(target_lon: float, target_lat: float, initial_buffer: float, threshold: int):
-    """Cache uniquement la géométrie finale ; jamais FlowDir/FlowAcc."""
+    
     grid_obj = catchment = sub_fdir = sub_acc = None
     try:
         grid_obj, catchment, sub_fdir, sub_acc, features = get_dynamic_catchment(
@@ -437,7 +437,7 @@ def delineate_catchment_geometry_cached(target_lon: float, target_lat: float, in
 
 
 def extract_river_network_ondemand(target_lon, target_lat, buffer_deg, threshold):
-    """Extraction à la demande du réseau hydrographique pour limiter la RAM."""
+    
     try:
         grid_obj, catchment, sub_fdir, sub_acc, _ = get_dynamic_catchment(target_lon, target_lat, buffer_deg, threshold)
         stream_mask = ((sub_acc > threshold) & catchment).astype(bool)
@@ -788,16 +788,21 @@ if map_data and map_data.get("last_clicked"):
     click_key = (round(lat, 7), round(lon, 7))
 
     if input_mode == "Clic sur la carte":
-        
-        if st.session_state.get("last_click_key") != click_key:
+
+        if (
+            st.session_state.get("last_click_key") != click_key
+            and not st.session_state.get("delineation_running", False)
+        ):
             st.session_state.last_click_key = click_key
             st.session_state.last_coords = (lat, lon)
             st.session_state.pending_coords = (lat, lon)
             st.session_state.analysis_requested = True
+            st.session_state.delineation_running = True
             st.session_state.network_attempted = False
             st.session_state.network_error = None
+
     else:
-        
+
         st.session_state.last_click_key = click_key
 
 with col_panel:
@@ -954,7 +959,7 @@ if do_phase_1:
             if features:
                 gdf_raw = gpd.GeoDataFrame.from_features(features).set_crs("EPSG:4326")
                 gdf_proj = gdf_raw.to_crs(epsg=target_epsg)
-                gdf_proj["geometry"] = gdf_proj.geometry.simplify(tolerance=50.0, preserve_topology=True)
+                gdf_proj["geometry"] = gdf_proj.geometry.simplify(tolerance=60.0, preserve_topology=True)
 
                 area_km2 = float(gdf_proj.geometry.area.sum() / 1e6)
 
@@ -996,12 +1001,14 @@ if do_phase_1:
             st.session_state.last_click_key = (round(target_lat, 7), round(target_lon, 7))
             st.session_state.pending_coords = None
             st.session_state.analysis_requested = False
+            st.session_state.delineation_running = False
             st.session_state.network_attempted = False
             st.session_state.network_error = None
             st.session_state.stream_gdf = None
             st.session_state.hydro_computed = False
             st.session_state.center_coords = [(miny + maxy) / 2.0, (minx + maxx) / 2.0]
             st.session_state.map_center = list(st.session_state.center_coords)
+            st.session_state.delineation_running = False
             
             t_elapsed = time.perf_counter() - t_phase1_start
             print(f"[CHRONO] Phase 1 terminée en {t_elapsed:.2f} s")
@@ -1012,6 +1019,7 @@ if do_phase_1:
         show_recovery_message(e, "de délimitation")
         st.session_state.analysis_requested = False
         st.session_state.pending_coords = None
+        st.session_state.delineation_running = False
 
 if (st.session_state.is_pro and st.session_state.catchment_gdf is not None and not st.session_state.get("hydro_computed", False)):
     try:
